@@ -1,0 +1,8 @@
+{
+  "name": "FamApp Payment & WinGo API Gateway",
+  "description": "Automated FamApp Gmail payment gateway API with 10-second background scanning & 10-minute auto-expiry, alongside high-speed WinGo 30S/1M prediction endpoints & God-Mode protected zip website hosting.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
