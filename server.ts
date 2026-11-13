@@ -1,6 +1,7 @@
 import express from 'express';
 import path from 'path';
 import fs from 'fs';
+import crypto from 'crypto';
 import multer from 'multer';
 import AdmZip from 'adm-zip';
 import { createServer as createViteServer } from 'vite';
@@ -228,6 +229,38 @@ let emailsInbox: EmailItem[] = [
   },
 ];
 
+const FAMAPP_STATE_FILE = path.resolve('/tmp/famapp_gateway_state.json');
+
+const persistFamAppState = () => {
+  try {
+    fs.writeFileSync(
+      FAMAPP_STATE_FILE,
+      JSON.stringify({
+        connectedEmail,
+        totalProcessedEmails,
+        activePayment,
+        paymentLogs: paymentLogs.slice(0, 100),
+        emailsInbox: emailsInbox.slice(0, 100),
+      })
+    );
+  } catch {
+    // Non-fatal
+  }
+};
+
+try {
+  if (fs.existsSync(FAMAPP_STATE_FILE)) {
+    const saved = JSON.parse(fs.readFileSync(FAMAPP_STATE_FILE, 'utf8'));
+    if (typeof saved.connectedEmail === 'string') connectedEmail = saved.connectedEmail;
+    if (typeof saved.totalProcessedEmails === 'number') totalProcessedEmails = saved.totalProcessedEmails;
+    if (Array.isArray(saved.paymentLogs)) paymentLogs = saved.paymentLogs;
+    if (Array.isArray(saved.emailsInbox)) emailsInbox = saved.emailsInbox;
+    if ('activePayment' in saved) activePayment = saved.activePayment;
+  }
+} catch {
+  // Ignore corrupt state file
+}
+
 // 10-Second Background Scanner Loop
 setInterval(() => {
   if (activePayment) {
@@ -237,6 +270,7 @@ setInterval(() => {
       const log = paymentLogs.find((l) => l.emailId === activePayment?.emailId);
       if (log) log.status = 'EXPIRED';
       activePayment = null;
+      persistFamAppState();
     }
   }
 }, 10000);
@@ -247,6 +281,7 @@ app.get('/api/payment/famapp/status', (req, res) => {
   if (activePayment && Date.now() > activePayment.expiresAt) {
     activePayment.status = 'EXPIRED';
     activePayment = null;
+    persistFamAppState();
   }
 
   res.json({
@@ -334,6 +369,7 @@ app.get('/api/payment/famapp/logs', (req, res) => {
 // Manual scanner trigger
 app.post('/api/payment/famapp/scan', (req, res) => {
   totalProcessedEmails += 1;
+  persistFamAppState();
   res.json({
     success: true,
     message: activePayment
@@ -347,6 +383,7 @@ app.post('/api/payment/famapp/scan', (req, res) => {
 // Reset processed cache
 app.post('/api/payment/famapp/reset-processed', (req, res) => {
   totalProcessedEmails = 0;
+  persistFamAppState();
   res.json({
     success: true,
     message: 'Processed payments cache has been reset.',
@@ -409,6 +446,8 @@ app.post('/api/payment/famapp/simulate', (req, res) => {
     parsedPayment: newPayment,
   });
 
+  persistFamAppState();
+
   res.json({
     success: true,
     message: 'Simulated payment created!',
@@ -421,6 +460,7 @@ app.post('/api/auth/gmail/direct-login', (req, res) => {
   const { email } = req.body;
   if (email && typeof email === 'string') {
     connectedEmail = email;
+    persistFamAppState();
   }
   res.json({
     success: true,
@@ -476,6 +516,8 @@ app.post('/api/gmail/compose', (req, res) => {
     isFamPayment: Boolean(isFamPayment),
     parsedPayment: parsed,
   });
+
+  persistFamAppState();
 
   res.json({
     success: true,
@@ -941,6 +983,7 @@ interface HostedSiteFile {
 interface HostedSite {
   siteId: string;
   title: string;
+  accessKey: string;
   originalSize: number;
   protectedSize: number;
   fileCount: number;
@@ -950,7 +993,41 @@ interface HostedSite {
   files: HostedSiteFile[];
 }
 
+const generateGodModeAccessKey = (seed?: string): string => {
+  const hex = seed
+    ? crypto.createHash('sha256').update(seed).digest('hex').slice(0, 12).toUpperCase()
+    : crypto.randomBytes(6).toString('hex').toUpperCase();
+  return `GMV3-${hex.slice(0, 4)}-${hex.slice(4, 8)}-${hex.slice(8, 12)}`;
+};
+
 const hostedSites = new Map<string, HostedSite>();
+const HOSTED_SITES_REGISTRY_FILE = path.resolve('/tmp/hosted_sites_registry.json');
+
+const persistHostedSites = () => {
+  try {
+    fs.writeFileSync(HOSTED_SITES_REGISTRY_FILE, JSON.stringify(Array.from(hostedSites.values())));
+  } catch {
+    // Non-fatal
+  }
+};
+
+try {
+  if (fs.existsSync(HOSTED_SITES_REGISTRY_FILE)) {
+    const savedSites = JSON.parse(fs.readFileSync(HOSTED_SITES_REGISTRY_FILE, 'utf8'));
+    if (Array.isArray(savedSites)) {
+      savedSites.forEach((s: HostedSite) => {
+        if (s?.siteId && fs.existsSync(path.join(SITES_DIR, s.siteId))) {
+          if (!s.accessKey) {
+            s.accessKey = generateGodModeAccessKey(s.siteId);
+          }
+          hostedSites.set(s.siteId, s);
+        }
+      });
+    }
+  }
+} catch {
+  // Ignore corrupt registry file
+}
 
 // Anti-DevTools / Anti-F12 protection snippet
 const ANTI_F12_SHIELD = `
@@ -1086,6 +1163,7 @@ app.post('/api/zip-host/upload', upload.single('zipFile'), (req, res) => {
     const siteRecord: HostedSite = {
       siteId,
       title,
+      accessKey: generateGodModeAccessKey(),
       originalSize,
       protectedSize,
       fileCount: allFiles.length,
@@ -1096,6 +1174,7 @@ app.post('/api/zip-host/upload', upload.single('zipFile'), (req, res) => {
     };
 
     hostedSites.set(siteId, siteRecord);
+    persistHostedSites();
 
     // Clean up temporary upload
     fs.unlink(req.file.path, () => {});
@@ -1116,6 +1195,7 @@ app.delete('/api/zip-host/site/:siteId', (req, res) => {
   const { siteId } = req.params;
   if (hostedSites.has(siteId)) {
     hostedSites.delete(siteId);
+    persistHostedSites();
     const siteDir = path.join(SITES_DIR, siteId);
     fs.rm(siteDir, { recursive: true, force: true }, () => {});
     return res.json({ success: true, message: 'Site deleted successfully.' });
@@ -1147,6 +1227,10 @@ app.post('/api/zip-host/reprotect/:siteId', (req, res) => {
   site.decoyCount += moreDecoys.length;
   site.fileCount += moreDecoys.length;
   site.protectedSize += moreBytes;
+  if (!site.accessKey) {
+    site.accessKey = generateGodModeAccessKey(siteId);
+  }
+  persistHostedSites();
 
   res.json({
     success: true,

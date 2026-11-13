@@ -461,23 +461,20 @@ export default function WinGoPredictor() {
       if (!silent) setLoading(true);
       const start = performance.now();
 
-      if (enginePreference === 'STANDALONE') {
-        activateClientAutonomous(mode, drawLimit, 'FORCED_STANDALONE', `${endpoint}?mode=offline`, 1);
-        setLoading(false);
-        return;
-      }
+      const isStandalone = enginePreference === 'STANDALONE';
+      const histUrl = isStandalone ? `${endpoint}?mode=offline` : endpoint;
+      const predUrl = isStandalone
+        ? `/api/wingo-predict-${mode}?mode=offline`
+        : `/api/wingo-predict-${mode}`;
 
       if (typeof navigator !== 'undefined' && !navigator.onLine) {
-        activateClientAutonomous(mode, drawLimit, 'BROWSER_OFFLINE', endpoint, 1);
+        activateClientAutonomous(mode, drawLimit, 'BROWSER_OFFLINE', histUrl, 1);
         setLoading(false);
         return;
       }
 
       try {
-        const [histRes, predRes] = await Promise.all([
-          fetch(endpoint),
-          fetch(`/api/wingo-predict-${mode}`),
-        ]);
+        const [histRes, predRes] = await Promise.all([fetch(histUrl), fetch(predUrl)]);
         const latencyMs = Math.round(performance.now() - start);
 
         if (!histRes.ok) {
@@ -577,7 +574,7 @@ export default function WinGoPredictor() {
         }
 
         setLastFetchInfo({
-          endpoint,
+          endpoint: histUrl,
           status: histRes.status,
           latencyMs,
           count: incomingList.length,
@@ -594,7 +591,7 @@ export default function WinGoPredictor() {
           {
             engineMode: resolvedEngine,
             source: histJson.source,
-            endpoint,
+            endpoint: histUrl,
             httpStatus: histRes.status,
             latencyMs,
             returnedCount: incomingList.length,
@@ -607,7 +604,7 @@ export default function WinGoPredictor() {
           mode,
           drawLimit,
           `FETCH_FALLBACK: ${err?.message || 'Network Offline'}`,
-          endpoint,
+          histUrl,
           latencyMs
         );
       } finally {
@@ -616,39 +613,6 @@ export default function WinGoPredictor() {
     },
     [enginePreference, activateClientAutonomous, appendDiagLog, calibrateServerClock]
   );
-
-  // If started directly in STANDALONE before any online sync, silently calibrate server clock offset once if reachable
-  useEffect(() => {
-    if (enginePreference !== 'STANDALONE') return;
-    if (typeof navigator !== 'undefined' && !navigator.onLine) return;
-    let cancelled = false;
-    fetch(`/api/wingo-live-status?game=${gameMode}`)
-      .then((r) => (r.ok ? r.json() : null))
-      .then((data) => {
-        if (cancelled || !data) return;
-        const prevOffset = clockOffsetMsRef.current;
-        const nextOffset = calibrateServerClock(
-          data.serverTime,
-          data.currentRound?.startTime,
-          data.currentRound?.endTime
-        );
-        if (Math.abs(nextOffset - prevOffset) >= 2000) {
-          activateClientAutonomous(
-            gameMode,
-            limit,
-            'CLOCK_CALIBRATED_SYNC',
-            `/api/wingo-history-${gameMode}-${limit}?mode=offline`,
-            0
-          );
-        }
-      })
-      .catch(() => {
-        // Completely offline — rely on persisted localStorage clock offset
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [enginePreference, gameMode, limit, calibrateServerClock, activateClientAutonomous]);
 
   // Poll on mode/limit/preference changes
   useEffect(() => {

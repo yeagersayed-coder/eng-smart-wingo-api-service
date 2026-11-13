@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { Zap, TrendingUp, FolderArchive, Activity, Server } from 'lucide-react';
+import { AnimatePresence, motion } from 'motion/react';
 import FamAppPaymentGateway from './components/FamAppPaymentGateway.js';
 import WinGoPredictor from './components/WinGoPredictor.js';
 import ZipHostVault from './components/ZipHostVault.js';
@@ -119,9 +120,19 @@ export default function App() {
 
       {/* Main Content Area */}
       <main className="flex-1 max-w-7xl mx-auto w-full px-4 sm:px-6 lg:px-8 py-8 pb-24 relative z-10">
-        {activeTab === 'famapp' && <FamAppPaymentGateway />}
-        {activeTab === 'wingo' && <WinGoPredictor />}
-        {activeTab === 'ziphost' && <ZipHostVault />}
+        <AnimatePresence mode="wait">
+          <motion.div
+            key={activeTab}
+            initial={{ opacity: 0, y: 10, scale: 0.995 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: -6, scale: 0.995 }}
+            transition={{ duration: 0.2, ease: [0.22, 1, 0.36, 1] }}
+          >
+            {activeTab === 'famapp' && <FamAppPaymentGateway />}
+            {activeTab === 'wingo' && <WinGoPredictor />}
+            {activeTab === 'ziphost' && <ZipHostVault />}
+          </motion.div>
+        </AnimatePresence>
       </main>
 
       {/* Footer */}

@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   Shield,
   Upload,
@@ -16,6 +16,7 @@ import {
   Lock,
   Layers,
   FolderArchive,
+  Key,
 } from 'lucide-react';
 
 interface HostedSiteFile {
@@ -27,6 +28,7 @@ interface HostedSiteFile {
 interface HostedSite {
   siteId: string;
   title: string;
+  accessKey?: string;
   originalSize: number;
   protectedSize: number;
   fileCount: number;
@@ -47,6 +49,7 @@ export default function ZipHostVault() {
 
   // Copy feedback
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [copiedKeyId, setCopiedKeyId] = useState<string | null>(null);
 
   // Inspector modal
   const [inspectSite, setInspectSite] = useState<HostedSite | null>(null);
@@ -56,10 +59,12 @@ export default function ZipHostVault() {
 
   // Toast
   const [toast, setToast] = useState<{ type: string; message: string } | null>(null);
+  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const showToast = (message: string, type = 'success') => {
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
     setToast({ type, message });
-    setTimeout(() => setToast(null), 3000);
+    toastTimerRef.current = setTimeout(() => setToast(null), 3000);
   };
 
   const fetchSites = async () => {
@@ -214,6 +219,12 @@ export default function ZipHostVault() {
     }
   };
 
+  const getGodModeKey = (site: HostedSite): string => {
+    if (site.accessKey) return site.accessKey;
+    const raw = site.siteId.replace(/[^a-zA-Z0-9]/g, '').toUpperCase().padEnd(12, 'X');
+    return `GMV3-${raw.slice(0, 4)}-${raw.slice(4, 8)}-${raw.slice(8, 12)}`;
+  };
+
   const copyLiveUrl = (url: string, id: string) => {
     const origin = typeof window !== 'undefined' ? window.location.origin : '';
     const full = `${origin}${url}`;
@@ -221,6 +232,17 @@ export default function ZipHostVault() {
     setCopiedId(id);
     showToast('Live URL copied to clipboard!');
     setTimeout(() => setCopiedId(null), 2000);
+  };
+
+  const copyAccessKey = async (accessKey: string, id: string) => {
+    try {
+      await navigator.clipboard.writeText(accessKey);
+      setCopiedKeyId(id);
+      showToast(`God-Mode access key (${accessKey}) copied to clipboard!`);
+      setTimeout(() => setCopiedKeyId((prev) => (prev === id ? null : prev)), 2000);
+    } catch {
+      showToast('Failed to copy access key to clipboard.', 'error');
+    }
   };
 
   const formatBytes = (bytes: number) => {
@@ -382,6 +404,33 @@ export default function ZipHostVault() {
                       </span>
                       <span>Total Files: {site.fileCount}</span>
                     </div>
+                    <div className="pt-1.5 flex flex-wrap items-center gap-2">
+                      <div className="inline-flex items-center gap-2 px-2.5 py-1 rounded-lg bg-slate-950 border border-amber-500/30 font-mono text-[11px]">
+                        <Key className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                        <span className="text-slate-400">God-Mode Key:</span>
+                        <code className="text-amber-300 font-bold tracking-wider select-all">
+                          {getGodModeKey(site)}
+                        </code>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => copyAccessKey(getGodModeKey(site), site.siteId)}
+                        className="px-2.5 py-1 bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/40 text-amber-300 rounded-lg text-[11px] font-bold font-mono flex items-center gap-1.5 transition cursor-pointer"
+                        title="Copy God-Mode Access Key to Clipboard"
+                      >
+                        {copiedKeyId === site.siteId ? (
+                          <>
+                            <Check className="w-3.5 h-3.5 text-emerald-400" />
+                            Copied Key!
+                          </>
+                        ) : (
+                          <>
+                            <Copy className="w-3.5 h-3.5" />
+                            Copy to Clipboard
+                          </>
+                        )}
+                      </button>
+                    </div>
                   </div>
 
                   <div className="flex flex-wrap items-center gap-2">
@@ -462,13 +511,34 @@ export default function ZipHostVault() {
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm">
           <div className="bg-[#0d1322] border border-slate-800 rounded-2xl p-6 max-w-2xl w-full space-y-4 max-h-[85vh] flex flex-col">
             <div className="flex items-center justify-between border-b border-slate-800 pb-3">
-              <div>
+              <div className="space-y-1">
                 <h3 className="text-sm font-bold text-white font-mono uppercase">
                   Archive File Tree &amp; Decoy Inspector: {inspectSite.title}
                 </h3>
-                <span className="text-[11px] font-mono text-slate-400">
-                  {inspectFiles.length} files total ({inspectFiles.filter((f) => f.isDecoy).length} decoys injected)
-                </span>
+                <div className="flex flex-wrap items-center gap-2 text-[11px] font-mono text-slate-400">
+                  <span>
+                    {inspectFiles.length} files total ({inspectFiles.filter((f) => f.isDecoy).length} decoys injected)
+                  </span>
+                  <span className="text-slate-700">•</span>
+                  <span className="text-amber-300 font-bold">Key: {getGodModeKey(inspectSite)}</span>
+                  <button
+                    type="button"
+                    onClick={() => copyAccessKey(getGodModeKey(inspectSite), `modal_${inspectSite.siteId}`)}
+                    className="px-2 py-0.5 bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/30 text-amber-300 rounded text-[10px] font-bold inline-flex items-center gap-1 cursor-pointer"
+                  >
+                    {copiedKeyId === `modal_${inspectSite.siteId}` ? (
+                      <>
+                        <Check className="w-3 h-3 text-emerald-400" />
+                        Copied
+                      </>
+                    ) : (
+                      <>
+                        <Copy className="w-3 h-3" />
+                        Copy Key
+                      </>
+                    )}
+                  </button>
+                </div>
               </div>
               <button
                 onClick={() => setInspectSite(null)}
