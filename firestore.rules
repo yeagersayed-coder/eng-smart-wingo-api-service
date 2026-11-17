@@ -1,0 +1,334 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Pillar 0: Default-deny global safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Core Reusable Security Primitives
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(userId) {
+      return isVerifiedUser() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isAdmin() {
+      return isVerifiedUser() && (
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid)) ||
+        request.auth.token.email == 'yeagersayed@gmail.com'
+      );
+    }
+
+    // Entity Blueprint Validators
+    function isValidUserPublicProfile(data) {
+      return data.keys().hasAll([
+        'uid', 'ownerId', 'displayName', 'role', 'preferredEngine', 'preferredGame', 'createdAt', 'updatedAt'
+      ])
+      && data.keys().hasOnly([
+        'uid', 'ownerId', 'displayName', 'photoUrl', 'role', 'preferredEngine', 'preferredGame', 'createdAt', 'updatedAt'
+      ])
+      && isValidId(data.uid)
+      && isValidId(data.ownerId)
+      && data.uid == request.auth.uid
+      && data.ownerId == request.auth.uid
+      && data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 100
+      && (!data.keys().hasAny(['photoUrl']) || (data.photoUrl is string && data.photoUrl.size() <= 500))
+      && data.role is string && data.role == 'member'
+      && data.preferredEngine is string && (data.preferredEngine == 'AUTO' || data.preferredEngine == 'STANDALONE')
+      && data.preferredGame is string && (data.preferredGame == '30s' || data.preferredGame == '1m')
+      && data.createdAt is timestamp
+      && data.updatedAt is timestamp;
+    }
+
+    function isValidUserPrivateInfo(data) {
+      return data.keys().hasAll(['ownerId', 'email', 'connectedGmail', 'createdAt', 'updatedAt'])
+      && data.keys().hasOnly(['ownerId', 'email', 'connectedGmail', 'createdAt', 'updatedAt'])
+      && isValidId(data.ownerId)
+      && data.ownerId == request.auth.uid
+      && data.email is string && data.email.size() >= 3 && data.email.size() <= 254
+      && data.connectedGmail is string && data.connectedGmail.size() <= 254
+      && data.createdAt is timestamp
+      && data.updatedAt is timestamp;
+    }
+
+    function isValidPaymentRecord(data) {
+      return data.keys().hasAll([
+        'ownerId', 'emailId', 'amount', 'rawAmountText', 'fromName', 'utr',
+        'transactionId', 'account', 'status', 'formattedTime', 'createdAt', 'updatedAt'
+      ])
+      && data.keys().hasOnly([
+        'ownerId', 'emailId', 'amount', 'rawAmountText', 'fromName', 'utr',
+        'transactionId', 'account', 'status', 'formattedTime', 'createdAt', 'updatedAt'
+      ])
+      && isValidId(data.ownerId)
+      && data.ownerId == request.auth.uid
+      && isValidId(data.emailId)
+      && data.amount is number && data.amount > 0 && data.amount <= 10000000
+      && data.rawAmountText is string && data.rawAmountText.size() >= 1 && data.rawAmountText.size() <= 32
+      && data.fromName is string && data.fromName.size() >= 1 && data.fromName.size() <= 100
+      && data.utr is string && data.utr.size() >= 6 && data.utr.size() <= 32 && data.utr.matches('^[a-zA-Z0-9_\\-]+$')
+      && data.transactionId is string && data.transactionId.size() >= 1 && data.transactionId.size() <= 64
+      && data.account is string && data.account.size() >= 1 && data.account.size() <= 64
+      && data.status is string && (data.status == 'ACTIVE' || data.status == 'EXPIRED')
+      && data.formattedTime is string && data.formattedTime.size() >= 1 && data.formattedTime.size() <= 64
+      && data.createdAt is timestamp
+      && data.updatedAt is timestamp;
+    }
+
+    function isValidWinGoPrediction(data) {
+      return data.keys().hasAll([
+        'ownerId', 'issueNumber', 'game', 'engineMode', 'predictedSignal', 'predictedColor',
+        'luckyNumbers', 'confidence', 'actualNumber', 'actualSize', 'outcomeStatus', 'createdAt', 'updatedAt'
+      ])
+      && data.keys().hasOnly([
+        'ownerId', 'issueNumber', 'game', 'engineMode', 'predictedSignal', 'predictedColor',
+        'luckyNumbers', 'confidence', 'actualNumber', 'actualSize', 'outcomeStatus', 'createdAt', 'updatedAt'
+      ])
+      && isValidId(data.ownerId)
+      && data.ownerId == request.auth.uid
+      && data.issueNumber is string && data.issueNumber.size() >= 10 && data.issueNumber.size() <= 32 && data.issueNumber.matches('^[0-9]+$')
+      && data.game is string && (data.game == '30s' || data.game == '1m')
+      && data.engineMode is string && (data.engineMode == 'LIVE_UPSTREAM' || data.engineMode == 'AUTONOMOUS_ENGINE')
+      && data.predictedSignal is string && (data.predictedSignal == 'BIG' || data.predictedSignal == 'SMALL')
+      && data.predictedColor is string && (data.predictedColor == 'GREEN' || data.predictedColor == 'RED' || data.predictedColor == 'VIOLET')
+      && data.luckyNumbers is list && data.luckyNumbers.size() >= 1 && data.luckyNumbers.size() <= 3 && data.luckyNumbers[0] is number
+      && data.confidence is string && data.confidence.size() >= 1 && data.confidence.size() <= 16
+      && data.actualNumber is number && data.actualNumber >= -1 && data.actualNumber <= 9
+      && data.actualSize is string && (data.actualSize == 'PENDING' || data.actualSize == 'big' || data.actualSize == 'small')
+      && data.outcomeStatus is string && (data.outcomeStatus == 'PENDING' || data.outcomeStatus == 'WIN' || data.outcomeStatus == 'LOSS')
+      && data.createdAt is timestamp
+      && data.updatedAt is timestamp;
+    }
+
+    function isValidVaultDeployment(data) {
+      return data.keys().hasAll([
+        'ownerId', 'siteId', 'title', 'accessKey', 'originalSize', 'protectedSize',
+        'fileCount', 'decoyCount', 'liveUrl', 'status', 'createdAt', 'updatedAt'
+      ])
+      && data.keys().hasOnly([
+        'ownerId', 'siteId', 'title', 'accessKey', 'originalSize', 'protectedSize',
+        'fileCount', 'decoyCount', 'liveUrl', 'status', 'createdAt', 'updatedAt'
+      ])
+      && isValidId(data.ownerId)
+      && data.ownerId == request.auth.uid
+      && isValidId(data.siteId) && data.siteId.size() >= 3 && data.siteId.size() <= 64
+      && data.title is string && data.title.size() >= 1 && data.title.size() <= 120
+      && data.accessKey is string && data.accessKey.size() >= 10 && data.accessKey.size() <= 32
+      && data.accessKey.matches('^GMV3-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$')
+      && data.originalSize is number && data.originalSize >= 0
+      && data.protectedSize is number && data.protectedSize >= data.originalSize
+      && data.fileCount is number && data.fileCount >= 1 && data.fileCount <= 50000
+      && data.decoyCount is number && data.decoyCount >= 0 && data.decoyCount <= 50000
+      && data.liveUrl is string && data.liveUrl.size() >= 1 && data.liveUrl.size() <= 256
+      && data.status is string && (data.status == 'PROTECTED' || data.status == 'ARCHIVED')
+      && data.createdAt is timestamp
+      && data.updatedAt is timestamp;
+    }
+
+    // Trusted Admin Registry (read-only for owner check, server-managed)
+    match /admins/{userId} {
+      allow get: if isOwner(userId) && isValidId(userId);
+      allow list, create, update, delete: if false;
+    }
+
+    // Master Gate: User Public Operational Profile (No PII)
+    match /users/{userId} {
+      allow get: if isValidId(userId) && (isOwner(userId) || isAdmin());
+      allow list: if isVerifiedUser() && existing().ownerId == request.auth.uid;
+
+      allow create: if isVerifiedUser()
+        && isValidId(userId)
+        && isValidUserPublicProfile(incoming())
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && isOwner(userId);
+
+      allow update: if isVerifiedUser()
+        && isValidId(userId)
+        && isValidUserPublicProfile(incoming())
+        && incoming().ownerId == existing().ownerId
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          isAdmin() || (
+            isOwner(userId)
+            && incoming().role == existing().role
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'displayName', 'photoUrl', 'preferredEngine', 'preferredGame', 'updatedAt'
+            ])
+          )
+        );
+
+      allow delete: if isValidId(userId) && (isOwner(userId) || isAdmin());
+
+      // Isolated PII Subcollection (email & connected Gmail)
+      match /private/{docId} {
+        allow get: if isValidId(userId) && isValidId(docId) && docId == 'info' && (isOwner(userId) || isAdmin());
+        allow list: if isOwner(userId) && existing().ownerId == request.auth.uid;
+
+        allow create: if isVerifiedUser()
+          && isValidId(userId)
+          && isValidId(docId)
+          && docId == 'info'
+          && isValidUserPrivateInfo(incoming())
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && isOwner(userId)
+          && exists(/databases/$(database)/documents/users/$(userId));
+
+        allow update: if isVerifiedUser()
+          && isValidId(userId)
+          && isValidId(docId)
+          && docId == 'info'
+          && isValidUserPrivateInfo(incoming())
+          && incoming().ownerId == existing().ownerId
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && (
+            isAdmin() || (
+              isOwner(userId)
+              && incoming().diff(existing()).affectedKeys().hasOnly([
+                'email', 'connectedGmail', 'updatedAt'
+              ])
+            )
+          );
+
+        allow delete: if isValidId(userId) && isValidId(docId) && (isOwner(userId) || isAdmin());
+      }
+
+      // FamApp Payment Gateway Records
+      match /payment_records/{recordId} {
+        allow get: if isValidId(userId) && isValidId(recordId) && (isOwner(userId) || isAdmin());
+        allow list: if isOwner(userId) && existing().ownerId == request.auth.uid;
+
+        allow create: if isVerifiedUser()
+          && isValidId(userId)
+          && isValidId(recordId)
+          && isValidPaymentRecord(incoming())
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && isOwner(userId)
+          && exists(/databases/$(database)/documents/users/$(userId));
+
+        allow update: if isVerifiedUser()
+          && isValidId(userId)
+          && isValidId(recordId)
+          && isValidPaymentRecord(incoming())
+          && incoming().ownerId == existing().ownerId
+          && incoming().emailId == existing().emailId
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && (
+            isAdmin() || (
+              isOwner(userId)
+              && existing().status == 'ACTIVE'
+              && incoming().status == 'EXPIRED'
+              && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt'])
+            )
+          );
+
+        allow delete: if isValidId(userId) && isValidId(recordId) && (isOwner(userId) || isAdmin());
+      }
+
+      // WinGo Tracked Predictions & Outcomes
+      match /wingo_predictions/{predictionId} {
+        allow get: if isValidId(userId) && isValidId(predictionId) && (isOwner(userId) || isAdmin());
+        allow list: if isOwner(userId) && existing().ownerId == request.auth.uid;
+
+        allow create: if isVerifiedUser()
+          && isValidId(userId)
+          && isValidId(predictionId)
+          && isValidWinGoPrediction(incoming())
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && isOwner(userId)
+          && exists(/databases/$(database)/documents/users/$(userId));
+
+        allow update: if isVerifiedUser()
+          && isValidId(userId)
+          && isValidId(predictionId)
+          && isValidWinGoPrediction(incoming())
+          && incoming().ownerId == existing().ownerId
+          && incoming().issueNumber == existing().issueNumber
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && (
+            isAdmin() || (
+              isOwner(userId)
+              && existing().outcomeStatus == 'PENDING'
+              && (incoming().outcomeStatus == 'WIN' || incoming().outcomeStatus == 'LOSS')
+              && incoming().diff(existing()).affectedKeys().hasOnly([
+                'actualNumber', 'actualSize', 'outcomeStatus', 'updatedAt'
+              ])
+            )
+          );
+
+        allow delete: if isValidId(userId) && isValidId(predictionId) && (isOwner(userId) || isAdmin());
+      }
+
+      // ZipHost Vault Protected Deployments
+      match /vault_deployments/{siteId} {
+        allow get: if isValidId(userId) && isValidId(siteId) && (isOwner(userId) || isAdmin());
+        allow list: if isOwner(userId) && existing().ownerId == request.auth.uid;
+
+        allow create: if isVerifiedUser()
+          && isValidId(userId)
+          && isValidId(siteId)
+          && isValidVaultDeployment(incoming())
+          && incoming().siteId == siteId
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && isOwner(userId)
+          && exists(/databases/$(database)/documents/users/$(userId));
+
+        allow update: if isVerifiedUser()
+          && isValidId(userId)
+          && isValidId(siteId)
+          && isValidVaultDeployment(incoming())
+          && incoming().ownerId == existing().ownerId
+          && incoming().siteId == existing().siteId
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && (
+            isAdmin() || (
+              isOwner(userId)
+              && existing().status == 'PROTECTED'
+              && (
+                (
+                  incoming().diff(existing()).affectedKeys().hasOnly([
+                    'protectedSize', 'fileCount', 'decoyCount', 'updatedAt'
+                  ])
+                ) || (
+                  incoming().status == 'ARCHIVED'
+                  && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt'])
+                )
+              )
+            )
+          );
+
+        allow delete: if isValidId(userId) && isValidId(siteId) && (isOwner(userId) || isAdmin());
+      }
+    }
+  }
+}

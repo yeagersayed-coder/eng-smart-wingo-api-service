@@ -20,6 +20,7 @@ import {
   ChevronUp,
   XCircle,
   Cpu,
+  Cloud,
 } from 'lucide-react';
 import {
   BarChart,
@@ -30,6 +31,25 @@ import {
   ResponsiveContainer,
   Cell,
 } from 'recharts';
+import {
+  collection,
+  doc,
+  limit as firestoreLimit,
+  onSnapshot,
+  query,
+  serverTimestamp,
+  setDoc,
+  updateDoc,
+  where,
+} from 'firebase/firestore';
+import {
+  db,
+  handleFirestoreError,
+  OperationType,
+  sanitizeFirestoreId,
+  truncateString,
+} from '../firebase.js';
+import { useFirebase } from '../contexts/FirebaseContext.js';
 import {
   WinGoDraw,
   WinGoPrediction,
@@ -228,11 +248,16 @@ export const generateOfflineHistoryLocal = (
 };
 
 export default function WinGoPredictor() {
-  const [gameMode, setGameMode] = useState<'30s' | '1m'>('30s');
-  const [enginePreference, setEnginePreference] = useState<'AUTO' | 'STANDALONE'>('AUTO');
+  const { user, authReady, profileSynced, profile, updatePreferences } = useFirebase();
+  const [gameMode, setGameMode] = useState<'30s' | '1m'>(profile.preferredGame || '30s');
+  const [enginePreference, setEnginePreference] = useState<'AUTO' | 'STANDALONE'>(profile.preferredEngine || 'AUTO');
   const [limit, setLimit] = useState(100);
   const [customInput, setCustomInput] = useState('100');
   const [draws, setDraws] = useState<WinGoDraw[]>([]);
+  const [cloudPredictions, setCloudPredictions] = useState<
+    Record<string, { outcomeStatus: 'PENDING' | 'WIN' | 'LOSS'; predictedSignal: 'BIG' | 'SMALL'; actualNumber: number }>
+  >({});
+  const syncingPredictionsRef = useRef<Set<string>>(new Set());
   const [loading, setLoading] = useState(true);
   const [apiType, setApiType] = useState<'public' | 'dev'>('public');
 
@@ -776,6 +801,128 @@ export default function WinGoPredictor() {
     );
   }, [prediction, activeEngine, appendDiagLog]);
 
+  // Real-time Firestore listener for tracked WinGo predictions
+  useEffect(() => {
+    if (!authReady || !user || !user.emailVerified || !profileSynced) {
+      setCloudPredictions({});
+      return;
+    }
+
+    const uid = sanitizeFirestoreId(user.uid, 'user_default', 128);
+    const colPath = `users/${uid}/wingo_predictions`;
+    const q = query(collection(db, 'users', uid, 'wingo_predictions'), where('ownerId', '==', uid), firestoreLimit(50));
+
+    const unsub = onSnapshot(
+      q,
+      (snapshot) => {
+        const nextMap: Record<
+          string,
+          { outcomeStatus: 'PENDING' | 'WIN' | 'LOSS'; predictedSignal: 'BIG' | 'SMALL'; actualNumber: number }
+        > = {};
+        snapshot.docs.forEach((docSnap) => {
+          const d = docSnap.data();
+          const status = d.outcomeStatus === 'WIN' ? 'WIN' : d.outcomeStatus === 'LOSS' ? 'LOSS' : 'PENDING';
+          nextMap[docSnap.id] = {
+            outcomeStatus: status,
+            predictedSignal: d.predictedSignal === 'SMALL' ? 'SMALL' : 'BIG',
+            actualNumber: typeof d.actualNumber === 'number' ? d.actualNumber : -1,
+          };
+        });
+        setCloudPredictions(nextMap);
+      },
+      (error) => {
+        handleFirestoreError(error, OperationType.LIST, colPath);
+      }
+    );
+
+    return () => unsub();
+  }, [authReady, user, profileSynced]);
+
+  // Persist newly locked WinGo predictions & reconcile completed draws in Firestore
+  useEffect(() => {
+    if (!authReady || !user || !user.emailVerified || !profileSynced) return;
+    const uid = sanitizeFirestoreId(user.uid, 'user_default', 128);
+
+    const syncWinGoToFirestore = async () => {
+      // 1. Save active prediction if valid numeric issueNumber
+      if (prediction && /^[0-9]{10,32}$/.test(prediction.targetPeriod)) {
+        const issueId = prediction.targetPeriod;
+        if (!cloudPredictions[issueId] && !syncingPredictionsRef.current.has(issueId)) {
+          syncingPredictionsRef.current.add(issueId);
+          const docPath = `users/${uid}/wingo_predictions/${issueId}`;
+          const matchedDraw = draws.find((d) => d.issueNumber === issueId);
+          const hasOutcome = Boolean(matchedDraw && matchedDraw.number >= 0 && matchedDraw.number <= 9);
+          const actualNumber = hasOutcome ? matchedDraw!.number : -1;
+          const actualSize: 'PENDING' | 'big' | 'small' = hasOutcome
+            ? matchedDraw!.number >= 5
+              ? 'big'
+              : 'small'
+            : 'PENDING';
+          const outcomeStatus: 'PENDING' | 'WIN' | 'LOSS' = hasOutcome
+            ? actualSize.toUpperCase() === prediction.signal
+              ? 'WIN'
+              : 'LOSS'
+            : 'PENDING';
+          const safeNums =
+            Array.isArray(prediction.luckyNumbers) && prediction.luckyNumbers.length > 0
+              ? prediction.luckyNumbers.slice(0, 3).map((n) => Number(n) || 0)
+              : [prediction.signal === 'BIG' ? 5 : 0];
+
+          try {
+            await setDoc(doc(db, 'users', uid, 'wingo_predictions', issueId), {
+              ownerId: uid,
+              issueNumber: issueId,
+              game: gameMode,
+              engineMode: activeEngine,
+              predictedSignal: prediction.signal === 'SMALL' ? 'SMALL' : 'BIG',
+              predictedColor:
+                prediction.color === 'RED' || prediction.color === 'VIOLET' ? prediction.color : 'GREEN',
+              luckyNumbers: safeNums,
+              confidence: truncateString(prediction.confidence, 16, '95.0'),
+              actualNumber,
+              actualSize,
+              outcomeStatus,
+              createdAt: serverTimestamp(),
+              updatedAt: serverTimestamp(),
+            });
+          } catch (err) {
+            handleFirestoreError(err, OperationType.CREATE, docPath);
+          } finally {
+            syncingPredictionsRef.current.delete(issueId);
+          }
+        }
+      }
+
+      // 2. Reconcile any PENDING predictions once their draw arrives
+      for (const [issueId, cloudEntry] of Object.entries(cloudPredictions)) {
+        if (cloudEntry.outcomeStatus !== 'PENDING' || syncingPredictionsRef.current.has(issueId)) continue;
+        const matchedDraw = draws.find((d) => d.issueNumber === issueId);
+        if (!matchedDraw || matchedDraw.number < 0 || matchedDraw.number > 9) continue;
+
+        syncingPredictionsRef.current.add(issueId);
+        const docPath = `users/${uid}/wingo_predictions/${issueId}`;
+        const actualSize: 'big' | 'small' = matchedDraw.number >= 5 ? 'big' : 'small';
+        const outcomeStatus: 'WIN' | 'LOSS' =
+          actualSize.toUpperCase() === cloudEntry.predictedSignal ? 'WIN' : 'LOSS';
+
+        try {
+          await updateDoc(doc(db, 'users', uid, 'wingo_predictions', issueId), {
+            actualNumber: matchedDraw.number,
+            actualSize,
+            outcomeStatus,
+            updatedAt: serverTimestamp(),
+          });
+        } catch (err) {
+          handleFirestoreError(err, OperationType.UPDATE, docPath);
+        } finally {
+          syncingPredictionsRef.current.delete(issueId);
+        }
+      }
+    };
+
+    syncWinGoToFirestore();
+  }, [authReady, user, profileSynced, prediction, draws, cloudPredictions, gameMode, activeEngine]);
+
   // Analytics Stats
   const analytics = useMemo(() => {
     let big = 0;
@@ -1013,7 +1160,10 @@ print_r($data['data']['list'][0]);
             {/* Engine Selector */}
             <div className="flex items-center gap-1 bg-slate-950 p-1 rounded-xl border border-slate-800">
               <button
-                onClick={() => setEnginePreference('AUTO')}
+                onClick={() => {
+                  setEnginePreference('AUTO');
+                  updatePreferences({ preferredEngine: 'AUTO' });
+                }}
                 className={`px-3 py-1.5 rounded-lg text-[11px] font-mono font-bold flex items-center gap-1.5 transition cursor-pointer ${
                   enginePreference === 'AUTO'
                     ? 'bg-indigo-600 text-white'
@@ -1024,7 +1174,10 @@ print_r($data['data']['list'][0]);
                 AUTO (LIVE)
               </button>
               <button
-                onClick={() => setEnginePreference('STANDALONE')}
+                onClick={() => {
+                  setEnginePreference('STANDALONE');
+                  updatePreferences({ preferredEngine: 'STANDALONE' });
+                }}
                 className={`px-3 py-1.5 rounded-lg text-[11px] font-mono font-bold flex items-center gap-1.5 transition cursor-pointer ${
                   enginePreference === 'STANDALONE'
                     ? 'bg-amber-500 text-black font-black'
@@ -1039,7 +1192,10 @@ print_r($data['data']['list'][0]);
             {/* 30S / 1M Switcher */}
             <div className="flex items-center gap-2">
               <button
-                onClick={() => setGameMode('30s')}
+                onClick={() => {
+                  setGameMode('30s');
+                  updatePreferences({ preferredGame: '30s' });
+                }}
                 className={`px-4 py-2.5 rounded-xl text-xs font-mono font-bold flex items-center gap-2 transition cursor-pointer ${
                   gameMode === '30s'
                     ? 'bg-gradient-to-r from-emerald-500 to-teal-600 text-black font-black shadow-lg shadow-emerald-500/20'
@@ -1049,7 +1205,10 @@ print_r($data['data']['list'][0]);
                 ⏱️ WINGO 30 SEC
               </button>
               <button
-                onClick={() => setGameMode('1m')}
+                onClick={() => {
+                  setGameMode('1m');
+                  updatePreferences({ preferredGame: '1m' });
+                }}
                 className={`px-4 py-2.5 rounded-xl text-xs font-mono font-bold flex items-center gap-2 transition cursor-pointer ${
                   gameMode === '1m'
                     ? 'bg-gradient-to-r from-emerald-500 to-teal-600 text-black font-black shadow-lg shadow-emerald-500/20'
@@ -1744,8 +1903,13 @@ print_r($data['data']['list'][0]);
                 ? `${analytics.wins} WIN / ${analytics.losses} MISS (${analytics.winRate}%)`
                 : 'Tracking Active'}
             </span>
-            <span className="text-[10px] text-slate-500 block mt-0.5">
-              Events Captured: {diagLogs.length}/100
+            <span className="text-[10px] text-slate-500 flex items-center gap-1.5 mt-0.5">
+              <span>Events: {diagLogs.length}/100</span>
+              {user && profileSynced && (
+                <span className="text-emerald-400 flex items-center gap-1 font-bold">
+                  • <Cloud className="w-2.5 h-2.5" /> {Object.keys(cloudPredictions).length} Cloud
+                </span>
+              )}
             </span>
           </div>
         </div>

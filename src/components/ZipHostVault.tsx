@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import {
   Shield,
   Upload,
@@ -17,7 +17,28 @@ import {
   Layers,
   FolderArchive,
   Key,
+  Cloud,
 } from 'lucide-react';
+import {
+  collection,
+  deleteDoc,
+  doc,
+  limit,
+  onSnapshot,
+  query,
+  serverTimestamp,
+  setDoc,
+  updateDoc,
+  where,
+} from 'firebase/firestore';
+import {
+  db,
+  handleFirestoreError,
+  OperationType,
+  sanitizeFirestoreId,
+  truncateString,
+} from '../firebase.js';
+import { useFirebase } from '../contexts/FirebaseContext.js';
 
 interface HostedSiteFile {
   path: string;
@@ -39,7 +60,9 @@ interface HostedSite {
 }
 
 export default function ZipHostVault() {
+  const { user, authReady, profileSynced } = useFirebase();
   const [sites, setSites] = useState<HostedSite[]>([]);
+  const [cloudSites, setCloudSites] = useState<HostedSite[]>([]);
   const [loading, setLoading] = useState(true);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [siteTitle, setSiteTitle] = useState('');
@@ -67,6 +90,51 @@ export default function ZipHostVault() {
     toastTimerRef.current = setTimeout(() => setToast(null), 3000);
   };
 
+  const getGodModeKey = (site: HostedSite): string => {
+    if (site.accessKey) return site.accessKey;
+    const raw = site.siteId.replace(/[^a-zA-Z0-9]/g, '').toUpperCase().padEnd(12, 'X');
+    return `GMV3-${raw.slice(0, 4)}-${raw.slice(4, 8)}-${raw.slice(8, 12)}`;
+  };
+
+  // Real-time Firestore listener for vault deployments
+  useEffect(() => {
+    if (!authReady || !user || !user.emailVerified || !profileSynced) {
+      setCloudSites([]);
+      return;
+    }
+
+    const uid = sanitizeFirestoreId(user.uid, 'user_default', 128);
+    const colPath = `users/${uid}/vault_deployments`;
+    const q = query(collection(db, 'users', uid, 'vault_deployments'), where('ownerId', '==', uid), limit(50));
+
+    const unsub = onSnapshot(
+      q,
+      (snapshot) => {
+        const list: HostedSite[] = snapshot.docs.map((docSnap) => {
+          const d = docSnap.data();
+          return {
+            siteId: String(d.siteId || docSnap.id),
+            title: String(d.title || 'Protected Site'),
+            accessKey: String(d.accessKey || ''),
+            originalSize: Number(d.originalSize) || 0,
+            protectedSize: Number(d.protectedSize) || 0,
+            fileCount: Number(d.fileCount) || 1,
+            decoyCount: Number(d.decoyCount) || 0,
+            liveUrl: String(d.liveUrl || `/site/${docSnap.id}/index.html`),
+            createdAt: d.createdAt?.toMillis?.() ?? Date.now(),
+            files: [],
+          };
+        });
+        setCloudSites(list);
+      },
+      (error) => {
+        handleFirestoreError(error, OperationType.LIST, colPath);
+      }
+    );
+
+    return () => unsub();
+  }, [authReady, user, profileSynced]);
+
   const fetchSites = async () => {
     try {
       const res = await fetch('/api/zip-host/sites');
@@ -82,6 +150,18 @@ export default function ZipHostVault() {
   useEffect(() => {
     fetchSites();
   }, []);
+
+  const mergedSites = useMemo(() => {
+    const map = new Map<string, HostedSite & { isCloudSynced?: boolean }>();
+    cloudSites.forEach((cs) => {
+      map.set(cs.siteId, { ...cs, isCloudSynced: true });
+    });
+    sites.forEach((ls) => {
+      const wasCloud = map.has(ls.siteId);
+      map.set(ls.siteId, { ...ls, isCloudSynced: wasCloud });
+    });
+    return Array.from(map.values()).sort((a, b) => b.createdAt - a.createdAt);
+  }, [sites, cloudSites]);
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files[0]) {
@@ -147,6 +227,35 @@ export default function ZipHostVault() {
       const data = await res.json();
 
       if (data.success) {
+        if (authReady && user && user.emailVerified && profileSynced && data.site) {
+          const uploadedSite: HostedSite = data.site;
+          const uid = sanitizeFirestoreId(user.uid, 'user_default', 128);
+          const safeSiteId = sanitizeFirestoreId(uploadedSite.siteId, 'site_001', 64);
+          const docPath = `users/${uid}/vault_deployments/${safeSiteId}`;
+          const validKey = /^GMV3-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$/.test(uploadedSite.accessKey || '')
+            ? uploadedSite.accessKey!
+            : getGodModeKey(uploadedSite);
+          const origSize = Math.max(0, Number(uploadedSite.originalSize) || 0);
+          const protSize = Math.max(origSize, Number(uploadedSite.protectedSize) || origSize);
+          try {
+            await setDoc(doc(db, 'users', uid, 'vault_deployments', safeSiteId), {
+              ownerId: uid,
+              siteId: safeSiteId,
+              title: truncateString(uploadedSite.title, 120, 'Protected Site'),
+              accessKey: validKey,
+              originalSize: origSize,
+              protectedSize: protSize,
+              fileCount: Math.max(1, Math.min(50000, Number(uploadedSite.fileCount) || 1)),
+              decoyCount: Math.max(0, Math.min(50000, Number(uploadedSite.decoyCount) || 0)),
+              liveUrl: truncateString(uploadedSite.liveUrl, 256, `/site/${safeSiteId}/index.html`),
+              status: 'PROTECTED',
+              createdAt: serverTimestamp(),
+              updatedAt: serverTimestamp(),
+            });
+          } catch (fsErr) {
+            handleFirestoreError(fsErr, OperationType.CREATE, docPath);
+          }
+        }
         setProgress(100);
         setUploadStep('Deploying protected live website URL...');
         await new Promise((r) => setTimeout(r, 300));
@@ -172,7 +281,17 @@ export default function ZipHostVault() {
     try {
       const res = await fetch(`/api/zip-host/site/${siteId}`, { method: 'DELETE' });
       const data = await res.json();
-      if (data.success) {
+      if (authReady && user && user.emailVerified && profileSynced) {
+        const uid = sanitizeFirestoreId(user.uid, 'user_default', 128);
+        const safeSiteId = sanitizeFirestoreId(siteId, 'site_001', 64);
+        const docPath = `users/${uid}/vault_deployments/${safeSiteId}`;
+        try {
+          await deleteDoc(doc(db, 'users', uid, 'vault_deployments', safeSiteId));
+        } catch (fsErr) {
+          handleFirestoreError(fsErr, OperationType.DELETE, docPath);
+        }
+      }
+      if (data.success || cloudSites.some((c) => c.siteId === siteId)) {
         showToast(`Deleted hosted site "${title}".`);
         if (inspectSite?.siteId === siteId) {
           setInspectSite(null);
@@ -190,6 +309,24 @@ export default function ZipHostVault() {
       const res = await fetch(`/api/zip-host/reprotect/${siteId}`, { method: 'POST' });
       const data = await res.json();
       if (data.success) {
+        if (authReady && user && user.emailVerified && profileSynced && data.site && cloudSites.some((c) => c.siteId === siteId)) {
+          const updatedSite: HostedSite = data.site;
+          const uid = sanitizeFirestoreId(user.uid, 'user_default', 128);
+          const safeSiteId = sanitizeFirestoreId(siteId, 'site_001', 64);
+          const docPath = `users/${uid}/vault_deployments/${safeSiteId}`;
+          const origSize = Math.max(0, Number(updatedSite.originalSize) || 0);
+          const protSize = Math.max(origSize, Number(updatedSite.protectedSize) || origSize);
+          try {
+            await updateDoc(doc(db, 'users', uid, 'vault_deployments', safeSiteId), {
+              protectedSize: protSize,
+              fileCount: Math.max(1, Math.min(50000, Number(updatedSite.fileCount) || 1)),
+              decoyCount: Math.max(0, Math.min(50000, Number(updatedSite.decoyCount) || 0)),
+              updatedAt: serverTimestamp(),
+            });
+          } catch (fsErr) {
+            handleFirestoreError(fsErr, OperationType.UPDATE, docPath);
+          }
+        }
         showToast('+120 More Decoy files injected successfully!');
         await fetchSites();
         if (inspectSite?.siteId === siteId) {
@@ -217,12 +354,6 @@ export default function ZipHostVault() {
     } finally {
       setLoadingFiles(false);
     }
-  };
-
-  const getGodModeKey = (site: HostedSite): string => {
-    if (site.accessKey) return site.accessKey;
-    const raw = site.siteId.replace(/[^a-zA-Z0-9]/g, '').toUpperCase().padEnd(12, 'X');
-    return `GMV3-${raw.slice(0, 4)}-${raw.slice(4, 8)}-${raw.slice(8, 12)}`;
   };
 
   const copyLiveUrl = (url: string, id: string) => {
@@ -288,11 +419,19 @@ export default function ZipHostVault() {
             </p>
           </div>
 
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <span className="px-3 py-1.5 rounded-xl bg-amber-950/80 border border-amber-500/40 text-amber-300 text-xs font-mono font-bold flex items-center gap-2">
               <Lock className="w-3.5 h-3.5 text-amber-400" />
               Anti-DevTools Shield v3
             </span>
+            <a
+              href="/api/project-export/edgeone-zip"
+              download="famapp-wingo-edgeone-clean.zip"
+              className="px-3 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-mono font-bold flex items-center gap-1.5 transition cursor-pointer shadow-lg shadow-indigo-600/20"
+            >
+              <Download className="w-3.5 h-3.5" />
+              Export Clean EdgeOne ZIP
+            </a>
           </div>
         </div>
       </div>
@@ -376,25 +515,37 @@ export default function ZipHostVault() {
         <div className="flex items-center justify-between">
           <h3 className="text-sm font-mono font-bold text-white uppercase flex items-center gap-2">
             <Layers className="w-4 h-4 text-amber-400" />
-            Hosted Protected Sites ({sites.length})
+            Hosted Protected Sites ({mergedSites.length})
+            {user && profileSynced && (
+              <span className="px-2 py-0.5 rounded bg-emerald-950/70 border border-emerald-500/30 text-emerald-300 text-[10px] font-bold flex items-center gap-1 normal-case">
+                <Cloud className="w-3 h-3" />
+                Firestore Synced ({cloudSites.length})
+              </span>
+            )}
           </h3>
           <span className="text-xs font-mono text-slate-500">Auto-Obfuscated &amp; Sandboxed</span>
         </div>
 
-        {sites.length > 0 ? (
+        {mergedSites.length > 0 ? (
           <div className="grid grid-cols-1 gap-4">
-            {sites.map((site) => (
+            {mergedSites.map((site) => (
               <div
                 key={site.siteId}
                 className="bg-[#090e1c] border border-slate-800 rounded-2xl p-5 hover:border-slate-700 transition"
               >
                 <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
                   <div className="space-y-1">
-                    <div className="flex items-center gap-2">
+                    <div className="flex flex-wrap items-center gap-2">
                       <h4 className="text-base font-bold text-white">{site.title}</h4>
                       <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-amber-950/80 text-amber-300 border border-amber-500/30">
                         GOD-MODE PROTECTED
                       </span>
+                      {site.isCloudSynced && (
+                        <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-emerald-950/70 text-emerald-300 border border-emerald-500/30 flex items-center gap-1">
+                          <Cloud className="w-3 h-3" />
+                          FIRESTORE
+                        </span>
+                      )}
                     </div>
                     <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs font-mono text-slate-400">
                       <span>ID: {site.siteId}</span>

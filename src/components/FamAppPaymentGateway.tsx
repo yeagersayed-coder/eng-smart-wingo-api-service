@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   Zap,
   Mail,
@@ -15,7 +15,27 @@ import {
   User,
   Inbox,
   ExternalLink,
+  Cloud,
 } from 'lucide-react';
+import {
+  collection,
+  doc,
+  limit,
+  onSnapshot,
+  query,
+  serverTimestamp,
+  setDoc,
+  updateDoc,
+  where,
+} from 'firebase/firestore';
+import {
+  db,
+  handleFirestoreError,
+  OperationType,
+  sanitizeFirestoreId,
+  truncateString,
+} from '../firebase.js';
+import { useFirebase } from '../contexts/FirebaseContext.js';
 
 interface PaymentData {
   emailId: string;
@@ -49,14 +69,17 @@ interface EmailItem {
 }
 
 export default function FamAppPaymentGateway() {
+  const { user, authReady, profileSynced, profile, updateConnectedGmail } = useFirebase();
   const [gatewayStatus, setGatewayStatus] = useState<any>(null);
   const [activePayment, setActivePayment] = useState<PaymentData | null>(null);
   const [emails, setEmails] = useState<EmailItem[]>([]);
   const [logs, setLogs] = useState<PaymentData[]>([]);
+  const [cloudPayments, setCloudPayments] = useState<Record<string, { status: 'ACTIVE' | 'EXPIRED'; record: PaymentData }>>({});
   const [loading, setLoading] = useState(true);
   const [scanning, setScanning] = useState(false);
   const [remainingSeconds, setRemainingSeconds] = useState(0);
   const [activeTab, setActiveTab] = useState<'api' | 'simulate' | 'logs' | 'inbox'>('api');
+  const syncingIdsRef = useRef<Set<string>>(new Set());
 
   // Modals
   const [showSimulateModal, setShowSimulateModal] = useState(false);
@@ -71,7 +94,7 @@ export default function FamAppPaymentGateway() {
   const [simulating, setSimulating] = useState(false);
 
   // Form state for login
-  const [loginEmail, setLoginEmail] = useState('shaktimahto1213@gmail.com');
+  const [loginEmail, setLoginEmail] = useState(profile.connectedGmail || 'shaktimahto1213@gmail.com');
 
   // Form state for compose
   const [composeRecipient, setComposeRecipient] = useState('shaktimahto1213@gmail.com');
@@ -95,6 +118,117 @@ export default function FamAppPaymentGateway() {
     setToast({ type, text });
     setTimeout(() => setToast(null), 3000);
   };
+
+  useEffect(() => {
+    if (profile.connectedGmail) {
+      setLoginEmail(profile.connectedGmail);
+    }
+  }, [profile.connectedGmail]);
+
+  // Real-time Firestore listener for payment records
+  useEffect(() => {
+    if (!authReady || !user || !user.emailVerified || !profileSynced) {
+      setCloudPayments({});
+      return;
+    }
+
+    const uid = sanitizeFirestoreId(user.uid, 'user_default', 128);
+    const colPath = `users/${uid}/payment_records`;
+    const q = query(collection(db, 'users', uid, 'payment_records'), where('ownerId', '==', uid), limit(50));
+
+    const unsub = onSnapshot(
+      q,
+      (snapshot) => {
+        const nextMap: Record<string, { status: 'ACTIVE' | 'EXPIRED'; record: PaymentData }> = {};
+        snapshot.docs.forEach((docSnap) => {
+          const d = docSnap.data();
+          nextMap[docSnap.id] = {
+            status: d.status === 'EXPIRED' ? 'EXPIRED' : 'ACTIVE',
+            record: {
+              emailId: String(d.emailId || docSnap.id),
+              amount: Number(d.amount) || 0,
+              rawAmountText: String(d.rawAmountText || `₹${d.amount}`),
+              fromName: String(d.fromName || 'FamApp Sender'),
+              utr: String(d.utr || ''),
+              transactionId: String(d.transactionId || ''),
+              formattedTime: String(d.formattedTime || ''),
+              account: String(d.account || 'FamApp UPI'),
+              sender: 'alerts@famapp.in',
+              subject: 'Payment Received via FamApp',
+              snippet: `Synced payment ₹${d.amount} from ${d.fromName}`,
+              receivedAt: d.createdAt?.toMillis?.() ?? Date.now(),
+              expiresAt: Date.now(),
+              status: d.status === 'EXPIRED' ? 'EXPIRED' : 'ACTIVE',
+            },
+          };
+        });
+        setCloudPayments(nextMap);
+      },
+      (error) => {
+        handleFirestoreError(error, OperationType.LIST, colPath);
+      }
+    );
+
+    return () => unsub();
+  }, [authReady, user, profileSynced]);
+
+  // Sync live gateway payment logs into Firestore cleanly
+  useEffect(() => {
+    if (!authReady || !user || !user.emailVerified || !profileSynced) return;
+    const candidates = [...(activePayment ? [activePayment] : []), ...logs];
+    if (candidates.length === 0) return;
+
+    const uid = sanitizeFirestoreId(user.uid, 'user_default', 128);
+
+    const syncRecords = async () => {
+      for (const item of candidates.slice(0, 15)) {
+        const recordId = sanitizeFirestoreId(item.emailId || item.utr, 'pay_01', 128);
+        if (syncingIdsRef.current.has(recordId)) continue;
+
+        const existingCloud = cloudPayments[recordId];
+        const targetStatus: 'ACTIVE' | 'EXPIRED' = item.status === 'EXPIRED' ? 'EXPIRED' : 'ACTIVE';
+        const docPath = `users/${uid}/payment_records/${recordId}`;
+
+        if (!existingCloud) {
+          syncingIdsRef.current.add(recordId);
+          try {
+            await setDoc(doc(db, 'users', uid, 'payment_records', recordId), {
+              ownerId: uid,
+              emailId: recordId,
+              amount: Math.min(10000000, Math.max(0.01, Number(item.amount) || 1)),
+              rawAmountText: truncateString(item.rawAmountText, 32, `₹${Number(item.amount) || 1}`),
+              fromName: truncateString(item.fromName, 100, 'FamApp Sender'),
+              utr: sanitizeFirestoreId(item.utr, '000000', 32).padEnd(6, '0').slice(0, 32),
+              transactionId: truncateString(item.transactionId, 64, recordId),
+              account: truncateString(item.account, 64, 'FamApp UPI'),
+              status: targetStatus,
+              formattedTime: truncateString(item.formattedTime, 64, new Date().toISOString()),
+              createdAt: serverTimestamp(),
+              updatedAt: serverTimestamp(),
+            });
+          } catch (err) {
+            handleFirestoreError(err, OperationType.CREATE, docPath);
+          } finally {
+            syncingIdsRef.current.delete(recordId);
+          }
+        } else if (existingCloud.status === 'ACTIVE' && targetStatus === 'EXPIRED') {
+          syncingIdsRef.current.add(recordId);
+          try {
+            await updateDoc(doc(db, 'users', uid, 'payment_records', recordId), {
+              status: 'EXPIRED',
+              updatedAt: serverTimestamp(),
+            });
+          } catch (err) {
+            handleFirestoreError(err, OperationType.UPDATE, docPath);
+          } finally {
+            syncingIdsRef.current.delete(recordId);
+          }
+        }
+      }
+    };
+
+    syncRecords();
+  }, [authReady, user, profileSynced, activePayment, logs, cloudPayments]);
 
   const fetchStatus = async () => {
     try {
@@ -226,6 +360,7 @@ export default function FamAppPaymentGateway() {
         body: JSON.stringify({ email: loginEmail }),
       });
       const data = await res.json();
+      await updateConnectedGmail(loginEmail);
       showToast(data.message || `Connected to ${loginEmail}`);
       setShowLoginModal(false);
       fetchStatus();
@@ -809,56 +944,76 @@ setInterval(verifyPayment, 10000);
       )}
 
       {/* TAB 3: AUDIT LOGS */}
-      {activeTab === 'logs' && (
-        <div className="bg-[#080d1a] border border-slate-800 rounded-2xl overflow-hidden">
-          <div className="p-4 border-b border-slate-800 flex items-center justify-between">
-            <span className="text-xs font-mono font-bold text-white uppercase">Processed Payment Audit Trail</span>
-            <span className="text-xs font-mono text-slate-400">{logs.length} Total Logs</span>
-          </div>
-          <div className="overflow-x-auto">
-            <table className="w-full text-left font-mono text-xs">
-              <thead className="bg-slate-950/80 text-slate-400 uppercase text-[10px] border-b border-slate-800">
-                <tr>
-                  <th className="py-3 px-4">UTR</th>
-                  <th className="py-3 px-4">Amount</th>
-                  <th className="py-3 px-4">Sender</th>
-                  <th className="py-3 px-4">Processed At</th>
-                  <th className="py-3 px-4">Status</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-800/60">
-                {logs.length > 0 ? (
-                  logs.map((log, idx) => (
-                    <tr key={idx} className="hover:bg-slate-900/40">
-                      <td className="py-3 px-4 text-amber-300 font-bold">{log.utr}</td>
-                      <td className="py-3 px-4 text-emerald-400 font-bold">{log.rawAmountText}</td>
-                      <td className="py-3 px-4 text-white">{log.fromName}</td>
-                      <td className="py-3 px-4 text-slate-400">{log.formattedTime}</td>
-                      <td className="py-3 px-4">
-                        <span
-                          className={`px-2 py-0.5 rounded text-[10px] font-bold ${
-                            log.status === 'ACTIVE'
-                              ? 'bg-emerald-950 text-emerald-300 border border-emerald-500/30'
-                              : 'bg-slate-800 text-slate-400'
-                          }`}
-                        >
-                          {log.status}
-                        </span>
+      {activeTab === 'logs' && (() => {
+        const mergedMap = new Map<string, PaymentData>();
+        Object.values(cloudPayments).forEach(({ record }) => {
+          mergedMap.set(sanitizeFirestoreId(record.emailId || record.utr, 'pay_01', 128), record);
+        });
+        logs.forEach((l) => {
+          mergedMap.set(sanitizeFirestoreId(l.emailId || l.utr, 'pay_01', 128), l);
+        });
+        const mergedLogs = Array.from(mergedMap.values()).sort((a, b) => (b.receivedAt || 0) - (a.receivedAt || 0));
+        const cloudCount = Object.keys(cloudPayments).length;
+
+        return (
+          <div className="bg-[#080d1a] border border-slate-800 rounded-2xl overflow-hidden">
+            <div className="p-4 border-b border-slate-800 flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-mono font-bold text-white uppercase">Processed Payment Audit Trail</span>
+                {user && profileSynced && (
+                  <span className="px-2 py-0.5 rounded bg-emerald-950/70 border border-emerald-500/30 text-emerald-300 font-mono text-[10px] font-bold flex items-center gap-1">
+                    <Cloud className="w-3 h-3" />
+                    Firestore Synced ({cloudCount})
+                  </span>
+                )}
+              </div>
+              <span className="text-xs font-mono text-slate-400">{mergedLogs.length} Total Logs</span>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-left font-mono text-xs">
+                <thead className="bg-slate-950/80 text-slate-400 uppercase text-[10px] border-b border-slate-800">
+                  <tr>
+                    <th className="py-3 px-4">UTR</th>
+                    <th className="py-3 px-4">Amount</th>
+                    <th className="py-3 px-4">Sender</th>
+                    <th className="py-3 px-4">Processed At</th>
+                    <th className="py-3 px-4">Status</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-800/60">
+                  {mergedLogs.length > 0 ? (
+                    mergedLogs.map((log, idx) => (
+                      <tr key={log.emailId || idx} className="hover:bg-slate-900/40">
+                        <td className="py-3 px-4 text-amber-300 font-bold">{log.utr}</td>
+                        <td className="py-3 px-4 text-emerald-400 font-bold">{log.rawAmountText}</td>
+                        <td className="py-3 px-4 text-white">{log.fromName}</td>
+                        <td className="py-3 px-4 text-slate-400">{log.formattedTime}</td>
+                        <td className="py-3 px-4">
+                          <span
+                            className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                              log.status === 'ACTIVE'
+                                ? 'bg-emerald-950 text-emerald-300 border border-emerald-500/30'
+                                : 'bg-slate-800 text-slate-400'
+                            }`}
+                          >
+                            {log.status}
+                          </span>
+                        </td>
+                      </tr>
+                    ))
+                  ) : (
+                    <tr>
+                      <td colSpan={5} className="py-8 text-center text-slate-500">
+                        No payment logs recorded yet.
                       </td>
                     </tr>
-                  ))
-                ) : (
-                  <tr>
-                    <td colSpan={5} className="py-8 text-center text-slate-500">
-                      No payment logs recorded yet.
-                    </td>
-                  </tr>
-                )}
-              </tbody>
-            </table>
+                  )}
+                </tbody>
+              </table>
+            </div>
           </div>
-        </div>
-      )}
+        );
+      })()}
 
       {/* TAB 4: GMAIL INBOX MONITOR */}
       {activeTab === 'inbox' && (

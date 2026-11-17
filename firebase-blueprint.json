@@ -1,0 +1,295 @@
+{
+  "entities": {
+    "UserPublicProfile": {
+      "title": "UserPublicProfile",
+      "description": "Public operational profile and workspace preferences without PII.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerId": {
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "displayName": {
+          "type": "string",
+          "maxLength": 100,
+          "minLength": 1
+        },
+        "photoUrl": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "role": {
+          "type": "string",
+          "enum": ["member"]
+        },
+        "preferredEngine": {
+          "type": "string",
+          "enum": ["AUTO", "STANDALONE"]
+        },
+        "preferredGame": {
+          "type": "string",
+          "enum": ["30s", "1m"]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["uid", "ownerId", "displayName", "role", "preferredEngine", "preferredGame", "createdAt", "updatedAt"]
+    },
+    "UserPrivateInfo": {
+      "title": "UserPrivateInfo",
+      "description": "Isolated PII document containing user email and connected Gmail address.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "email": {
+          "type": "string",
+          "maxLength": 254,
+          "minLength": 3
+        },
+        "connectedGmail": {
+          "type": "string",
+          "maxLength": 254
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["ownerId", "email", "connectedGmail", "createdAt", "updatedAt"]
+    },
+    "PaymentRecord": {
+      "title": "PaymentRecord",
+      "description": "Captured or simulated FamApp UPI payment record synced to Firestore.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "emailId": {
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "amount": {
+          "type": "number"
+        },
+        "rawAmountText": {
+          "type": "string",
+          "maxLength": 32,
+          "minLength": 1
+        },
+        "fromName": {
+          "type": "string",
+          "maxLength": 100,
+          "minLength": 1
+        },
+        "utr": {
+          "type": "string",
+          "maxLength": 32,
+          "minLength": 6,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "transactionId": {
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 1
+        },
+        "account": {
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 1
+        },
+        "status": {
+          "type": "string",
+          "enum": ["ACTIVE", "EXPIRED"]
+        },
+        "formattedTime": {
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 1
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["ownerId", "emailId", "amount", "rawAmountText", "fromName", "utr", "transactionId", "account", "status", "formattedTime", "createdAt", "updatedAt"]
+    },
+    "WinGoTrackedPrediction": {
+      "title": "WinGoTrackedPrediction",
+      "description": "Tracked WinGo round prediction and verified draw outcome.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "issueNumber": {
+          "type": "string",
+          "maxLength": 32,
+          "minLength": 10,
+          "pattern": "^[0-9]+$"
+        },
+        "game": {
+          "type": "string",
+          "enum": ["30s", "1m"]
+        },
+        "engineMode": {
+          "type": "string",
+          "enum": ["LIVE_UPSTREAM", "AUTONOMOUS_ENGINE"]
+        },
+        "predictedSignal": {
+          "type": "string",
+          "enum": ["BIG", "SMALL"]
+        },
+        "predictedColor": {
+          "type": "string",
+          "enum": ["GREEN", "RED", "VIOLET"]
+        },
+        "luckyNumbers": {
+          "type": "array"
+        },
+        "confidence": {
+          "type": "string",
+          "maxLength": 16,
+          "minLength": 1
+        },
+        "actualNumber": {
+          "type": "number"
+        },
+        "actualSize": {
+          "type": "string",
+          "enum": ["PENDING", "big", "small"]
+        },
+        "outcomeStatus": {
+          "type": "string",
+          "enum": ["PENDING", "WIN", "LOSS"]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["ownerId", "issueNumber", "game", "engineMode", "predictedSignal", "predictedColor", "luckyNumbers", "confidence", "actualNumber", "actualSize", "outcomeStatus", "createdAt", "updatedAt"]
+    },
+    "VaultDeployment": {
+      "title": "VaultDeployment",
+      "description": "Protected ZipHost Vault deployment record with God-Mode access key.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "siteId": {
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 3,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "title": {
+          "type": "string",
+          "maxLength": 120,
+          "minLength": 1
+        },
+        "accessKey": {
+          "type": "string",
+          "maxLength": 32,
+          "minLength": 10,
+          "pattern": "^GMV3-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$"
+        },
+        "originalSize": {
+          "type": "number"
+        },
+        "protectedSize": {
+          "type": "number"
+        },
+        "fileCount": {
+          "type": "number"
+        },
+        "decoyCount": {
+          "type": "number"
+        },
+        "liveUrl": {
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1
+        },
+        "status": {
+          "type": "string",
+          "enum": ["PROTECTED", "ARCHIVED"]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["ownerId", "siteId", "title", "accessKey", "originalSize", "protectedSize", "fileCount", "decoyCount", "liveUrl", "status", "createdAt", "updatedAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserPublicProfile" },
+      "description": "Public operational user profile and gateway preferences."
+    },
+    "/users/{userId}/private/{docId}": {
+      "schema": { "$ref": "#/entities/UserPrivateInfo" },
+      "description": "Isolated PII document storing verified user email and connected Gmail inbox."
+    },
+    "/users/{userId}/payment_records/{recordId}": {
+      "schema": { "$ref": "#/entities/PaymentRecord" },
+      "description": "User-owned FamApp payment gateway capture records."
+    },
+    "/users/{userId}/wingo_predictions/{predictionId}": {
+      "schema": { "$ref": "#/entities/WinGoTrackedPrediction" },
+      "description": "User-owned WinGo signal predictions and reconciled round outcomes."
+    },
+    "/users/{userId}/vault_deployments/{siteId}": {
+      "schema": { "$ref": "#/entities/VaultDeployment" },
+      "description": "User-owned ZipHost Vault protected website metadata and God-Mode access keys."
+    }
+  }
+}

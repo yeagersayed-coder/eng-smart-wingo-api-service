@@ -1,11 +1,13 @@
 import React, { useState, useEffect } from 'react';
-import { Zap, TrendingUp, FolderArchive, Activity, Server } from 'lucide-react';
+import { Zap, TrendingUp, FolderArchive, Activity, Server, Download, LogIn, LogOut, Cloud, AlertTriangle } from 'lucide-react';
 import { AnimatePresence, motion } from 'motion/react';
 import FamAppPaymentGateway from './components/FamAppPaymentGateway.js';
 import WinGoPredictor from './components/WinGoPredictor.js';
 import ZipHostVault from './components/ZipHostVault.js';
+import { useFirebase } from './contexts/FirebaseContext.js';
 
 export default function App() {
+  const { user, authReady, profileSynced, dbConnected, signingIn, authError, signInWithGoogle, signOutUser } = useFirebase();
   const [activeTab, setActiveTab] = useState<'famapp' | 'wingo' | 'ziphost'>('famapp');
   const [latency, setLatency] = useState(24);
 
@@ -55,7 +57,7 @@ export default function App() {
             </div>
 
             {/* Live Metrics Header Badges */}
-            <div className="flex items-center gap-3">
+            <div className="flex flex-wrap items-center gap-2.5">
               <div className="bg-slate-900/90 border border-slate-800 rounded-xl px-3 py-1.5 flex items-center gap-2">
                 <Activity className="w-3.5 h-3.5 text-slate-400" />
                 <div className="text-left font-mono">
@@ -74,8 +76,66 @@ export default function App() {
                   </span>
                 </div>
               </div>
+
+              {authReady && (
+                user ? (
+                  <div className="bg-slate-900/90 border border-emerald-500/30 rounded-xl px-3 py-1.5 flex items-center gap-2.5 font-mono">
+                    {user.photoURL ? (
+                      <img src={user.photoURL} alt={user.displayName || 'User'} className="w-6 h-6 rounded-lg object-cover border border-slate-700" referrerPolicy="no-referrer" />
+                    ) : (
+                      <div className="w-6 h-6 rounded-lg bg-emerald-500/20 border border-emerald-500/40 flex items-center justify-center text-[11px] font-bold text-emerald-300">
+                        {(user.displayName || user.email || 'U').charAt(0).toUpperCase()}
+                      </div>
+                    )}
+                    <div className="text-left leading-tight">
+                      <span className="text-[9px] uppercase text-emerald-400 flex items-center gap-1 font-bold">
+                        <Cloud className="w-2.5 h-2.5" />
+                        {profileSynced ? 'Firestore Synced' : 'Connecting...'}
+                      </span>
+                      <span className="text-[11px] font-bold text-white block max-w-[140px] truncate">
+                        {user.displayName || user.email}
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={signOutUser}
+                      className="p-1.5 rounded-lg bg-slate-800 hover:bg-rose-950/60 text-slate-400 hover:text-rose-300 transition cursor-pointer"
+                      title="Sign out"
+                    >
+                      <LogOut className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={signInWithGoogle}
+                    disabled={signingIn}
+                    className="bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/40 rounded-xl px-3.5 py-2 flex items-center gap-2 text-emerald-200 hover:text-white transition font-mono text-xs font-bold cursor-pointer disabled:opacity-50"
+                    title="Sign in with Google to sync payments, WinGo signals & ZipHost keys to Firestore"
+                  >
+                    <LogIn className="w-3.5 h-3.5 text-emerald-400" />
+                    <span>{signingIn ? 'Signing in...' : 'Google Cloud Sync'}</span>
+                  </button>
+                )
+              )}
+
+              <a
+                href="/api/project-export/edgeone-zip"
+                download="famapp-wingo-edgeone-clean.zip"
+                className="bg-indigo-600/20 hover:bg-indigo-600/35 border border-indigo-500/40 rounded-xl px-3.5 py-2 flex items-center gap-2 text-indigo-200 hover:text-white transition font-mono text-xs font-bold cursor-pointer"
+                title="Download clean EdgeOne Pages ready project ZIP"
+              >
+                <Download className="w-3.5 h-3.5 text-indigo-400" />
+                <span>EdgeOne ZIP</span>
+              </a>
             </div>
           </div>
+          {authError && (
+            <div className="mt-3 px-3 py-2 rounded-xl bg-rose-950/60 border border-rose-500/40 text-rose-200 font-mono text-[11px] flex items-center gap-2">
+              <AlertTriangle className="w-3.5 h-3.5 text-rose-400 shrink-0" />
+              <span className="truncate">{authError}</span>
+            </div>
+          )}
 
           {/* Primary Navigation Tabs */}
           <div className="mt-6 flex flex-wrap items-center gap-2 bg-slate-950 p-1.5 rounded-2xl border border-slate-800/80 max-w-fit">
@@ -143,7 +203,7 @@ export default function App() {
             WinGo 30S Developer Gateway Node Online • JSON Payload compliant • Standard UTF-8 Content-Type
           </p>
           <p className="text-[10px] text-slate-600">
-            System latency metrics and active draws auto-commit directly to active Firestore cluster instance.
+            Firestore Cluster (owner-jabed-islam): {dbConnected ? 'Connected' : 'Standby'} • {user ? `Authenticated as ${user.email}` : 'Sign in with Google to enable cloud sync'}
           </p>
         </div>
       </footer>
