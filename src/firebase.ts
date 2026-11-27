@@ -90,17 +90,20 @@ export const truncateString = (raw: string | null | undefined, maxLength: number
   return sliced.length > 0 ? sliced : fallback.slice(0, maxLength);
 };
 
-export async function testConnection(): Promise<boolean> {
+export async function testConnection(): Promise<{ connected: boolean; latencyMs: number }> {
+  const start = typeof performance !== 'undefined' ? performance.now() : Date.now();
   try {
     await getDocFromServer(doc(db, 'test', 'connection'));
-    return true;
+    const latencyMs = Math.max(8, Math.round((typeof performance !== 'undefined' ? performance.now() : Date.now()) - start));
+    return { connected: true, latencyMs };
   } catch (error) {
+    const latencyMs = Math.max(8, Math.round((typeof performance !== 'undefined' ? performance.now() : Date.now()) - start));
     if (error instanceof Error && error.message.includes('the client is offline')) {
       console.error('Please check your Firebase configuration.');
-      return false;
+      return { connected: false, latencyMs };
     }
-    // Permission denied on default-deny test doc confirms server reachability
-    return true;
+    // Permission denied on default-deny test doc confirms live Firestore server reachability
+    return { connected: true, latencyMs };
   }
 }
 

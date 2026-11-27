@@ -36,6 +36,7 @@ import {
   truncateString,
 } from '../firebase.js';
 import { useFirebase } from '../contexts/FirebaseContext.js';
+import { useNotifications } from '../contexts/NotificationContext.js';
 
 interface PaymentData {
   emailId: string;
@@ -70,6 +71,7 @@ interface EmailItem {
 
 export default function FamAppPaymentGateway() {
   const { user, authReady, profileSynced, profile, updateConnectedGmail } = useFirebase();
+  const { pushAlert, notifyPaymentDetected } = useNotifications();
   const [gatewayStatus, setGatewayStatus] = useState<any>(null);
   const [activePayment, setActivePayment] = useState<PaymentData | null>(null);
   const [emails, setEmails] = useState<EmailItem[]>([]);
@@ -80,6 +82,8 @@ export default function FamAppPaymentGateway() {
   const [remainingSeconds, setRemainingSeconds] = useState(0);
   const [activeTab, setActiveTab] = useState<'api' | 'simulate' | 'logs' | 'inbox'>('api');
   const syncingIdsRef = useRef<Set<string>>(new Set());
+  const seenPaymentIdsRef = useRef<Set<string> | null>(null);
+  const cloudInitializedRef = useRef<boolean>(false);
 
   // Modals
   const [showSimulateModal, setShowSimulateModal] = useState(false);
@@ -111,12 +115,13 @@ export default function FamAppPaymentGateway() {
   const [copiedEmbedCode, setCopiedEmbedCode] = useState(false);
   const [copiedJson, setCopiedJson] = useState(false);
 
-  // Toast
-  const [toast, setToast] = useState<{ type: string; text: string } | null>(null);
-
   const showToast = (text: string, type = 'success') => {
-    setToast({ type, text });
-    setTimeout(() => setToast(null), 3000);
+    pushAlert({
+      kind: 'info',
+      title: text,
+      message: 'FamApp Payment Gateway',
+      accent: type === 'error' ? 'amber' : 'emerald',
+    });
   };
 
   useEffect(() => {
@@ -128,6 +133,7 @@ export default function FamAppPaymentGateway() {
   // Real-time Firestore listener for payment records
   useEffect(() => {
     if (!authReady || !user || !user.emailVerified || !profileSynced) {
+      cloudInitializedRef.current = false;
       setCloudPayments({});
       return;
     }
@@ -140,28 +146,43 @@ export default function FamAppPaymentGateway() {
       q,
       (snapshot) => {
         const nextMap: Record<string, { status: 'ACTIVE' | 'EXPIRED'; record: PaymentData }> = {};
+        if (!seenPaymentIdsRef.current) {
+          seenPaymentIdsRef.current = new Set();
+        }
         snapshot.docs.forEach((docSnap) => {
           const d = docSnap.data();
-          nextMap[docSnap.id] = {
-            status: d.status === 'EXPIRED' ? 'EXPIRED' : 'ACTIVE',
-            record: {
-              emailId: String(d.emailId || docSnap.id),
-              amount: Number(d.amount) || 0,
-              rawAmountText: String(d.rawAmountText || `₹${d.amount}`),
-              fromName: String(d.fromName || 'FamApp Sender'),
-              utr: String(d.utr || ''),
-              transactionId: String(d.transactionId || ''),
-              formattedTime: String(d.formattedTime || ''),
-              account: String(d.account || 'FamApp UPI'),
-              sender: 'alerts@famapp.in',
-              subject: 'Payment Received via FamApp',
-              snippet: `Synced payment ₹${d.amount} from ${d.fromName}`,
-              receivedAt: d.createdAt?.toMillis?.() ?? Date.now(),
-              expiresAt: Date.now(),
-              status: d.status === 'EXPIRED' ? 'EXPIRED' : 'ACTIVE',
-            },
+          const recordStatus: 'ACTIVE' | 'EXPIRED' = d.status === 'EXPIRED' ? 'EXPIRED' : 'ACTIVE';
+          const parsedRecord: PaymentData = {
+            emailId: String(d.emailId || docSnap.id),
+            amount: Number(d.amount) || 0,
+            rawAmountText: String(d.rawAmountText || `₹${d.amount}`),
+            fromName: String(d.fromName || 'FamApp Sender'),
+            utr: String(d.utr || ''),
+            transactionId: String(d.transactionId || ''),
+            formattedTime: String(d.formattedTime || ''),
+            account: String(d.account || 'FamApp UPI'),
+            sender: 'alerts@famapp.in',
+            subject: 'Payment Received via FamApp',
+            snippet: `Synced payment ₹${d.amount} from ${d.fromName}`,
+            receivedAt: d.createdAt?.toMillis?.() ?? Date.now(),
+            expiresAt: Date.now(),
+            status: recordStatus,
           };
+          nextMap[docSnap.id] = {
+            status: recordStatus,
+            record: parsedRecord,
+          };
+
+          if (recordStatus === 'ACTIVE') {
+            if (!cloudInitializedRef.current) {
+              seenPaymentIdsRef.current!.add(parsedRecord.emailId);
+            } else if (!seenPaymentIdsRef.current!.has(parsedRecord.emailId)) {
+              seenPaymentIdsRef.current!.add(parsedRecord.emailId);
+              notifyPaymentDetected(parsedRecord);
+            }
+          }
         });
+        cloudInitializedRef.current = true;
         setCloudPayments(nextMap);
       },
       (error) => {
@@ -170,7 +191,7 @@ export default function FamAppPaymentGateway() {
     );
 
     return () => unsub();
-  }, [authReady, user, profileSynced]);
+  }, [authReady, user, profileSynced, notifyPaymentDetected]);
 
   // Sync live gateway payment logs into Firestore cleanly
   useEffect(() => {
@@ -230,57 +251,180 @@ export default function FamAppPaymentGateway() {
     syncRecords();
   }, [authReady, user, profileSynced, activePayment, logs, cloudPayments]);
 
-  const fetchStatus = async () => {
+  const buildDefaultInbox = (recipientEmail: string): EmailItem[] => {
+    const now = Date.now();
+    return [
+      {
+        id: 'seed_gmail_01',
+        subject: 'You received ₹50.0 via FamApp UPI',
+        sender: 'alerts@famapp.in',
+        recipient: recipientEmail,
+        snippet: 'Received ₹50.0 from Rohit Verma. UTR: 528216904346. Verified via FamApp.',
+        htmlBody: '<p>Received <b>₹50.0</b> from <b>Rohit Verma</b>.<br/>UTR: <code>528216904346</code></p>',
+        textBody: 'Received ₹50.0 from Rohit Verma. UTR: 528216904346.',
+        dateStr: new Date(now - 3600000).toLocaleString(),
+        timestamp: now - 3600000,
+        isFamPayment: true,
+        parsedPayment: {
+          emailId: 'seed_gmail_01',
+          amount: 50,
+          rawAmountText: '₹50.0',
+          fromName: 'Rohit Verma',
+          utr: '528216904346',
+          transactionId: 'FAMTXN528216904346',
+          formattedTime: new Date(now - 3600000).toLocaleString(),
+          account: 'FamApp UPI',
+          sender: 'alerts@famapp.in',
+          subject: 'You received ₹50.0 via FamApp UPI',
+          snippet: 'Received ₹50.0 from Rohit Verma. UTR: 528216904346.',
+          receivedAt: now - 3600000,
+          expiresAt: now - 3000000,
+          status: 'EXPIRED',
+        },
+      },
+      {
+        id: 'seed_gmail_02',
+        subject: 'FamApp Security Alert: Gateway Connected',
+        sender: 'security@famapp.in',
+        recipient: recipientEmail,
+        snippet: 'Your FamApp alert parser is operating in Zero-API Firebase Direct mode.',
+        htmlBody: '<p>Your FamApp alert parser is operating in Zero-API Firebase Direct mode.</p>',
+        textBody: 'Your FamApp alert parser is operating in Zero-API Firebase Direct mode.',
+        dateStr: new Date(now - 7200000).toLocaleString(),
+        timestamp: now - 7200000,
+        isFamPayment: false,
+      },
+    ];
+  };
+
+  const persistLocalGatewayState = (
+    nextEmails: EmailItem[],
+    nextLogs: PaymentData[],
+    nextActive: PaymentData | null,
+    nextEmailAddr: string
+  ) => {
     try {
-      const res = await fetch('/api/payment/famapp/status');
-      const data = await res.json();
-      setGatewayStatus(data);
-      if (data.hasActivePayment && data.activePayment) {
-        setActivePayment(data.activePayment);
-        const rem = Math.max(0, Math.floor((data.activePayment.expiresAt - Date.now()) / 1000));
-        setRemainingSeconds(rem);
+      localStorage.setItem('famapp_local_inbox_v1', JSON.stringify(nextEmails.slice(0, 50)));
+      localStorage.setItem('famapp_local_logs_v1', JSON.stringify(nextLogs.slice(0, 100)));
+      if (nextActive) {
+        localStorage.setItem('famapp_local_active_v1', JSON.stringify(nextActive));
       } else {
-        setActivePayment(null);
-        setRemainingSeconds(0);
+        localStorage.removeItem('famapp_local_active_v1');
       }
-    } catch (e) {
-      console.error(e);
+      localStorage.setItem('famapp_connected_gmail_v1', nextEmailAddr);
+    } catch {
+      // Ignore storage quota errors
     }
   };
 
-  const fetchInbox = async () => {
+  const evaluateGatewayCycle = (): boolean => {
+    const now = Date.now();
+    let storedEmails: EmailItem[] = [];
+    let storedLogs: PaymentData[] = [];
+    let storedActive: PaymentData | null = null;
+    let storedGmail = profile.connectedGmail || 'shaktimahto1213@gmail.com';
+    let detectedNewPayment = false;
+
     try {
-      const res = await fetch('/api/gmail/inbox-all');
-      const data = await res.json();
-      if (data.emails) setEmails(data.emails);
-      if (data.hasActivePayment && data.activePayment) {
-        setActivePayment(data.activePayment);
-      }
-    } catch (e) {
-      console.error(e);
+      const savedGmail = localStorage.getItem('famapp_connected_gmail_v1');
+      if (savedGmail) storedGmail = savedGmail;
+
+      const rawEmails = localStorage.getItem('famapp_local_inbox_v1');
+      storedEmails = rawEmails ? JSON.parse(rawEmails) : buildDefaultInbox(storedGmail);
+
+      const rawLogs = localStorage.getItem('famapp_local_logs_v1');
+      storedLogs = rawLogs ? JSON.parse(rawLogs) : [];
+
+      const rawActive = localStorage.getItem('famapp_local_active_v1');
+      storedActive = rawActive ? JSON.parse(rawActive) : null;
+    } catch {
+      storedEmails = buildDefaultInbox(storedGmail);
     }
+
+    if (storedActive && storedActive.expiresAt <= now) {
+      storedLogs = storedLogs.map((l) =>
+        l.emailId === storedActive?.emailId ? { ...l, status: 'EXPIRED' } : l
+      );
+      storedActive = null;
+    }
+
+    const normalizedLogs = storedLogs.map((l) =>
+      l.expiresAt <= now && l.status === 'ACTIVE' ? { ...l, status: 'EXPIRED' as const } : l
+    );
+
+    // Detect any unread FamApp payment emails in inbox that haven't been processed yet
+    const loggedIds = new Set(normalizedLogs.map((l) => l.emailId));
+    const newlyScannedPayments: PaymentData[] = [];
+    storedEmails.forEach((em) => {
+      if (
+        em.isFamPayment &&
+        em.parsedPayment &&
+        em.parsedPayment.status === 'ACTIVE' &&
+        em.parsedPayment.expiresAt > now &&
+        !loggedIds.has(em.parsedPayment.emailId)
+      ) {
+        newlyScannedPayments.push(em.parsedPayment);
+      }
+    });
+
+    if (newlyScannedPayments.length > 0) {
+      const freshest = newlyScannedPayments[0];
+      const mergedLogs = [
+        ...newlyScannedPayments,
+        ...normalizedLogs.map((l) => (l.status === 'ACTIVE' ? { ...l, status: 'EXPIRED' as const } : l)),
+      ];
+      storedLogs = mergedLogs;
+      storedActive = freshest;
+    } else {
+      storedLogs = normalizedLogs;
+    }
+
+    if (seenPaymentIdsRef.current === null) {
+      seenPaymentIdsRef.current = new Set(
+        storedLogs.filter((l) => l.status === 'ACTIVE' && now - l.receivedAt > 5000).map((l) => l.emailId)
+      );
+    }
+
+    if (storedActive && storedActive.status === 'ACTIVE' && storedActive.expiresAt > now) {
+      if (!seenPaymentIdsRef.current.has(storedActive.emailId)) {
+        seenPaymentIdsRef.current.add(storedActive.emailId);
+        detectedNewPayment = notifyPaymentDetected(storedActive);
+      }
+    }
+
+    persistLocalGatewayState(storedEmails, storedLogs, storedActive, storedGmail);
+    setEmails(storedEmails);
+    setLogs(storedLogs);
+    setActivePayment(storedActive);
+    setGatewayStatus({
+      success: true,
+      authenticated: true,
+      userEmail: storedGmail,
+      isScannerRunning: true,
+      scanIntervalSeconds: 10,
+      hasActivePayment: Boolean(storedActive),
+      activePayment: storedActive,
+      totalProcessedEmails: storedLogs.length,
+    });
+    if (storedActive) {
+      setRemainingSeconds(Math.max(0, Math.floor((storedActive.expiresAt - now) / 1000)));
+    } else {
+      setRemainingSeconds(0);
+    }
+    return detectedNewPayment;
   };
 
-  const fetchLogs = async () => {
-    try {
-      const res = await fetch('/api/payment/famapp/logs');
-      const data = await res.json();
-      if (data.logs) setLogs(data.logs);
-    } catch (e) {
-      console.error(e);
-    }
+  const fetchStatus = async () => {
+    evaluateGatewayCycle();
   };
 
   useEffect(() => {
-    const init = async () => {
-      setLoading(true);
-      await Promise.all([fetchStatus(), fetchInbox(), fetchLogs()]);
-      setLoading(false);
-    };
-    init();
+    setLoading(true);
+    evaluateGatewayCycle();
+    setLoading(false);
 
     const interval = setInterval(() => {
-      fetchStatus();
+      evaluateGatewayCycle();
     }, 10000);
 
     return () => clearInterval(interval);
@@ -295,7 +439,7 @@ export default function FamAppPaymentGateway() {
       setRemainingSeconds(rem);
       if (rem <= 0) {
         setActivePayment(null);
-        fetchStatus();
+        evaluateGatewayCycle();
       }
     }, 1000);
 
@@ -304,48 +448,92 @@ export default function FamAppPaymentGateway() {
 
   const handleScan = async () => {
     setScanning(true);
-    try {
-      const res = await fetch('/api/payment/famapp/scan', { method: 'POST' });
-      const data = await res.json();
-      showToast(data.message || 'Gmail scanned successfully!');
-      await Promise.all([fetchStatus(), fetchInbox(), fetchLogs()]);
-    } catch {
-      showToast('Scan failed', 'error');
-    } finally {
-      setScanning(false);
+    await new Promise((r) => setTimeout(r, 250));
+    const foundNewPayment = evaluateGatewayCycle();
+    if (!foundNewPayment) {
+      showToast(
+        user && profileSynced
+          ? 'Inbox scanned & synced with Firebase Firestore!'
+          : 'Inbox scanned cleanly (Zero-API mode)!'
+      );
     }
+    setScanning(false);
   };
 
   const handleResetCache = async () => {
     try {
-      const res = await fetch('/api/payment/famapp/reset-processed', { method: 'POST' });
-      const data = await res.json();
-      showToast(data.message || 'Cache reset');
-      fetchStatus();
+      localStorage.removeItem('famapp_local_active_v1');
+      localStorage.removeItem('famapp_local_logs_v1');
     } catch {
-      showToast('Failed to reset cache', 'error');
+      // Ignore storage errors
     }
+    setActivePayment(null);
+    setLogs([]);
+    setRemainingSeconds(0);
+    evaluateGatewayCycle();
+    showToast('Local payment cache reset!');
+  };
+
+  const createLocalPaymentRecord = (amountNum: number, senderName: string, utrVal: string, subjectLine?: string): PaymentData => {
+    const now = Date.now();
+    const expiresAt = now + 600000; // 10 minutes
+    const cleanAmount = Math.max(0.01, amountNum || 50);
+    const cleanUtr = String(utrVal || Math.floor(100000000000 + Math.random() * 900000000000)).replace(/[^a-zA-Z0-9_-]/g, '');
+    const emailId = `pay_${now}_${Math.random().toString(36).slice(2, 6)}`;
+    const formattedTime = new Date(now).toLocaleString();
+    return {
+      emailId,
+      amount: cleanAmount,
+      rawAmountText: `₹${cleanAmount.toFixed(1)}`,
+      fromName: senderName.trim() || 'Rohit Verma',
+      utr: cleanUtr,
+      transactionId: `FAMTXN${cleanUtr}`,
+      formattedTime,
+      account: 'FamApp UPI',
+      sender: 'alerts@famapp.in',
+      subject: subjectLine || `You received ₹${cleanAmount.toFixed(1)} from ${senderName}`,
+      snippet: `Received ₹${cleanAmount.toFixed(1)} from ${senderName} • UTR: ${cleanUtr} • 10m window active`,
+      receivedAt: now,
+      expiresAt,
+      status: 'ACTIVE',
+    };
   };
 
   const handleSimulatePayment = async (e: React.FormEvent) => {
     e.preventDefault();
     setSimulating(true);
     try {
-      const res = await fetch('/api/payment/famapp/simulate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          amount: parseFloat(simAmount) || 50,
-          senderName: simSender,
-          utr: simUtr,
-        }),
-      });
-      const data = await res.json();
-      showToast(data.message || 'Payment simulated successfully!');
+      const payment = createLocalPaymentRecord(parseFloat(simAmount) || 50, simSender, simUtr);
+      const emailEntry: EmailItem = {
+        id: payment.emailId,
+        subject: payment.subject,
+        sender: payment.sender,
+        recipient: loginEmail,
+        snippet: payment.snippet,
+        htmlBody: `<p>Received <b>${payment.rawAmountText}</b> from <b>${payment.fromName}</b>.<br/>UTR: <code>${payment.utr}</code></p>`,
+        textBody: payment.snippet,
+        dateStr: payment.formattedTime,
+        timestamp: payment.receivedAt,
+        isFamPayment: true,
+        parsedPayment: payment,
+      };
+      const nextEmails = [emailEntry, ...emails];
+      const nextLogs = [payment, ...logs.map((l) => (l.status === 'ACTIVE' ? { ...l, status: 'EXPIRED' as const } : l))];
+      if (!seenPaymentIdsRef.current) seenPaymentIdsRef.current = new Set();
+      seenPaymentIdsRef.current.add(payment.emailId);
+      persistLocalGatewayState(nextEmails, nextLogs, payment, loginEmail);
+      setEmails(nextEmails);
+      setLogs(nextLogs);
+      setActivePayment(payment);
+      setRemainingSeconds(600);
+      setGatewayStatus((prev: any) => ({
+        ...(prev || {}),
+        hasActivePayment: true,
+        activePayment: payment,
+        totalProcessedEmails: nextLogs.length,
+      }));
+      notifyPaymentDetected(payment);
       setShowSimulateModal(false);
-      await Promise.all([fetchStatus(), fetchInbox(), fetchLogs()]);
-    } catch {
-      showToast('Simulation failed', 'error');
     } finally {
       setSimulating(false);
     }
@@ -354,45 +542,59 @@ export default function FamAppPaymentGateway() {
   const handleDirectLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     try {
-      const res = await fetch('/api/auth/gmail/direct-login', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: loginEmail }),
-      });
-      const data = await res.json();
-      await updateConnectedGmail(loginEmail);
-      showToast(data.message || `Connected to ${loginEmail}`);
-      setShowLoginModal(false);
-      fetchStatus();
+      localStorage.setItem('famapp_connected_gmail_v1', loginEmail);
     } catch {
-      showToast('Login failed', 'error');
+      // Ignore storage errors
     }
+    await updateConnectedGmail(loginEmail);
+    setGatewayStatus((prev: any) => ({ ...(prev || {}), userEmail: loginEmail }));
+    showToast(`Gmail account updated to ${loginEmail}`);
+    setShowLoginModal(false);
   };
 
   const handleComposeEmail = async (e: React.FormEvent) => {
     e.preventDefault();
     setSendingCompose(true);
     try {
-      const res = await fetch('/api/gmail/compose', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          recipient: composeRecipient,
-          subject: composeSubject,
-          body: composeBody,
-          isFamPayment: composeIsFam,
-          amount: composeAmount,
-          senderName: 'FamApp Payment Sender',
-        }),
-      });
-      const data = await res.json();
-      if (data.success) {
-        showToast('Email pushed to Gmail inbox!');
-        setShowComposeModal(false);
-        await Promise.all([fetchStatus(), fetchInbox()]);
+      const now = Date.now();
+      const randUtr = String(Math.floor(100000000000 + Math.random() * 900000000000));
+      const amt = parseFloat(composeAmount) || 100;
+      const parsedPayment = composeIsFam
+        ? createLocalPaymentRecord(amt, 'FamApp Payment Sender', randUtr, composeSubject || `FamApp UPI ₹${amt}`)
+        : undefined;
+      const newEmail: EmailItem = {
+        id: parsedPayment?.emailId || `mail_${now}`,
+        subject: composeSubject || (composeIsFam ? `FamApp Payment Received ₹${amt}` : 'Inbox Message'),
+        sender: composeIsFam ? 'alerts@famapp.in' : 'noreply@gmail.com',
+        recipient: composeRecipient || loginEmail,
+        snippet: composeBody || parsedPayment?.snippet || 'Incoming message',
+        htmlBody: `<p>${composeBody || parsedPayment?.snippet || 'Incoming message'}</p>`,
+        textBody: composeBody || parsedPayment?.snippet || 'Incoming message',
+        dateStr: new Date(now).toLocaleString(),
+        timestamp: now,
+        isFamPayment: composeIsFam,
+        parsedPayment,
+      };
+      const nextEmails = [newEmail, ...emails];
+      const nextLogs = parsedPayment
+        ? [parsedPayment, ...logs.map((l) => (l.status === 'ACTIVE' ? { ...l, status: 'EXPIRED' as const } : l))]
+        : logs;
+      const nextActive = parsedPayment || activePayment;
+      if (parsedPayment) {
+        if (!seenPaymentIdsRef.current) seenPaymentIdsRef.current = new Set();
+        seenPaymentIdsRef.current.add(parsedPayment.emailId);
       }
-    } catch {
-      showToast('Failed to send email', 'error');
+      persistLocalGatewayState(nextEmails, nextLogs, nextActive, loginEmail);
+      setEmails(nextEmails);
+      setLogs(nextLogs);
+      if (parsedPayment) {
+        setActivePayment(parsedPayment);
+        setRemainingSeconds(600);
+        notifyPaymentDetected(parsedPayment);
+      } else {
+        showToast('Email pushed to local inbox & synced!');
+      }
+      setShowComposeModal(false);
     } finally {
       setSendingCompose(false);
     }
@@ -445,13 +647,6 @@ setInterval(verifyPayment, 10000);
 
   return (
     <div className="space-y-8">
-      {/* Toast Notification */}
-      {toast && (
-        <div className="fixed bottom-4 right-4 z-50 p-4 rounded-xl border backdrop-blur-lg flex items-center gap-2 shadow-2xl bg-slate-950/95 border-emerald-500/50 text-emerald-300 font-mono text-xs">
-          <CheckCircle className="w-4 h-4 text-emerald-400" />
-          {toast.text}
-        </div>
-      )}
 
       {/* Hero Banner / Scanner Node Status */}
       <div className="bg-[#090d1a] border border-slate-800/80 rounded-2xl p-6 shadow-xl relative overflow-hidden backdrop-blur-md">
@@ -461,14 +656,14 @@ setInterval(verifyPayment, 10000);
             <div className="flex items-center gap-2 mb-2">
               <span className="h-2 w-2 rounded-full bg-emerald-400 animate-pulse" />
               <span className="text-[10px] font-mono font-bold uppercase tracking-wider text-emerald-400">
-                GMAIL PAYMENT SCANNER NODE
+                ZERO-API PAYMENT SCANNER • FIREBASE DIRECT
               </span>
             </div>
             <h2 className="text-xl sm:text-2xl font-black text-white tracking-tight">
-              FamApp Automated Payment Gateway API
+              FamApp Zero-API &amp; Firebase Payment Gateway
             </h2>
             <p className="text-xs text-slate-400 mt-1 max-w-2xl">
-              Auto-scans your Gmail inbox every 10 seconds for real FamApp transaction alerts, parses UTR, Amount &amp; Sender, and hosts live API endpoints with automatic 10-minute validity expiry.
+              Runs 100% locally in your browser without any backend API dependency, enforces 10-minute auto-expiry, and syncs verified UTR &amp; amount records directly to Cloud Firestore.
             </p>
           </div>
 

@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
+import JSZip from 'jszip';
 import {
   Shield,
   Upload,
@@ -40,6 +41,45 @@ import {
 } from '../firebase.js';
 import { useFirebase } from '../contexts/FirebaseContext.js';
 
+const ANTI_F12_SHIELD = `
+<script data-vault-shield="god-mode">
+(function() {
+  document.addEventListener('contextmenu', function(e) { e.preventDefault(); return false; });
+  document.addEventListener('keydown', function(e) {
+    if (e.keyCode === 123 || (e.ctrlKey && e.shiftKey && (e.keyCode === 73 || e.keyCode === 74 || e.keyCode === 67)) || (e.ctrlKey && e.keyCode === 85)) {
+      e.preventDefault();
+      return false;
+    }
+  });
+})();
+</script>
+`;
+
+const DECOY_DIRECTORIES = [
+  'assets/vendor/wasm_runtime',
+  'core/kernel/obfuscated_v3',
+  'api/internal/grpc_stubs',
+  'modules/auth/tokens_v2',
+  'lib/crypto/scrambled_hashes',
+  'dist/chunks/runtime_worker',
+  'plugins/telemetry_guard',
+  'assets/shims/legacy_polyfills',
+];
+
+const generateClientDecoys = (count = 128, offset = 0): HostedSiteFile[] => {
+  const extensions = ['.js', '.json', '.wasm.map', '.min.css', '.vue.cache', '.ts.map', '.bin'];
+  const decoys: HostedSiteFile[] = [];
+  for (let i = 1; i <= count; i++) {
+    const idx = i + offset;
+    const dir = DECOY_DIRECTORIES[idx % DECOY_DIRECTORIES.length];
+    const ext = extensions[idx % extensions.length];
+    const filePath = `${dir}/decoy_module_0x${(idx * 1337).toString(16).padStart(4, '0')}_shard_${idx}${ext}`;
+    const size = 512 + ((idx * 257) % 8192);
+    decoys.push({ path: filePath, size, isDecoy: true });
+  }
+  return decoys;
+};
+
 interface HostedSiteFile {
   path: string;
   size: number;
@@ -74,11 +114,16 @@ export default function ZipHostVault() {
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [copiedKeyId, setCopiedKeyId] = useState<string | null>(null);
 
-  // Inspector modal
+  // Inspector & Sandbox Preview modals
   const [inspectSite, setInspectSite] = useState<HostedSite | null>(null);
   const [inspectFiles, setInspectFiles] = useState<HostedSiteFile[]>([]);
   const [loadingFiles, setLoadingFiles] = useState(false);
   const [filterType, setFilterType] = useState<'all' | 'decoys' | 'user'>('all');
+  const [previewSite, setPreviewSite] = useState<{ title: string; html: string } | null>(null);
+
+  // In-memory protected ZIP bundles & entry HTML
+  const siteBundlesRef = useRef<Map<string, JSZip>>(new Map());
+  const sitePreviewHtmlRef = useRef<Map<string, string>>(new Map());
 
   // Toast
   const [toast, setToast] = useState<{ type: string; message: string } | null>(null);
@@ -94,6 +139,18 @@ export default function ZipHostVault() {
     if (site.accessKey) return site.accessKey;
     const raw = site.siteId.replace(/[^a-zA-Z0-9]/g, '').toUpperCase().padEnd(12, 'X');
     return `GMV3-${raw.slice(0, 4)}-${raw.slice(4, 8)}-${raw.slice(8, 12)}`;
+  };
+
+  const persistLocalSites = (nextSites: HostedSite[]) => {
+    try {
+      const compact = nextSites.slice(0, 20).map((s) => ({
+        ...s,
+        files: s.files.slice(0, 200),
+      }));
+      localStorage.setItem('ziphost_local_sites_v1', JSON.stringify(compact));
+    } catch {
+      // Ignore storage quota errors
+    }
   };
 
   // Real-time Firestore listener for vault deployments
@@ -137,11 +194,13 @@ export default function ZipHostVault() {
 
   const fetchSites = async () => {
     try {
-      const res = await fetch('/api/zip-host/sites');
-      const data = await res.json();
-      if (data.sites) setSites(data.sites);
+      const raw = localStorage.getItem('ziphost_local_sites_v1');
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) setSites(parsed);
+      }
     } catch {
-      showToast('Error fetching hosted sites', 'error');
+      // Ignore storage errors
     } finally {
       setLoading(false);
     }
@@ -157,8 +216,13 @@ export default function ZipHostVault() {
       map.set(cs.siteId, { ...cs, isCloudSynced: true });
     });
     sites.forEach((ls) => {
-      const wasCloud = map.has(ls.siteId);
-      map.set(ls.siteId, { ...ls, isCloudSynced: wasCloud });
+      const prev = map.get(ls.siteId);
+      map.set(ls.siteId, {
+        ...ls,
+        ...(prev || {}),
+        files: ls.files && ls.files.length > 0 ? ls.files : prev?.files || [],
+        isCloudSynced: Boolean(prev),
+      });
     });
     return Array.from(map.values()).sort((a, b) => b.createdAt - a.createdAt);
   }, [sites, cloudSites]);
@@ -200,74 +264,125 @@ export default function ZipHostVault() {
     }
 
     setUploading(true);
-    setProgress(15);
-    setUploadStep('Reading ZIP archive package...');
+    setProgress(20);
+    setUploadStep('Reading ZIP archive in browser (Zero-API)...');
 
     try {
-      await new Promise((r) => setTimeout(r, 400));
-      setProgress(40);
-      setUploadStep('Extracting website structure & parsing assets...');
+      const sourceZip = await JSZip.loadAsync(selectedFile);
+      const protectedZip = new JSZip();
+      const title = truncateString(siteTitle || selectedFile.name.replace(/\.[^/.]+$/, ''), 120, 'Protected Site');
+      const siteId = `site_${Math.random().toString(36).substring(2, 9)}`;
 
-      await new Promise((r) => setTimeout(r, 400));
-      setProgress(70);
-      setUploadStep('Generating 120+ Decoy / Junk files in root and subfolders...');
+      setProgress(45);
+      setUploadStep('Extracting website assets & injecting Anti-F12 Shield...');
 
-      await new Promise((r) => setTimeout(r, 400));
-      setProgress(90);
-      setUploadStep('Obfuscating JavaScript source code & applying Anti-F12 Shield...');
+      const sourceFiles: HostedSiteFile[] = [];
+      let originalSize = 0;
+      let entryHtml = '';
 
-      const formData = new FormData();
-      formData.append('zipFile', selectedFile);
-      formData.append('title', siteTitle || selectedFile.name.replace(/\.[^/.]+$/, ''));
-
-      const res = await fetch('/api/zip-host/upload', {
-        method: 'POST',
-        body: formData,
-      });
-      const data = await res.json();
-
-      if (data.success) {
-        if (authReady && user && user.emailVerified && profileSynced && data.site) {
-          const uploadedSite: HostedSite = data.site;
-          const uid = sanitizeFirestoreId(user.uid, 'user_default', 128);
-          const safeSiteId = sanitizeFirestoreId(uploadedSite.siteId, 'site_001', 64);
-          const docPath = `users/${uid}/vault_deployments/${safeSiteId}`;
-          const validKey = /^GMV3-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$/.test(uploadedSite.accessKey || '')
-            ? uploadedSite.accessKey!
-            : getGodModeKey(uploadedSite);
-          const origSize = Math.max(0, Number(uploadedSite.originalSize) || 0);
-          const protSize = Math.max(origSize, Number(uploadedSite.protectedSize) || origSize);
-          try {
-            await setDoc(doc(db, 'users', uid, 'vault_deployments', safeSiteId), {
-              ownerId: uid,
-              siteId: safeSiteId,
-              title: truncateString(uploadedSite.title, 120, 'Protected Site'),
-              accessKey: validKey,
-              originalSize: origSize,
-              protectedSize: protSize,
-              fileCount: Math.max(1, Math.min(50000, Number(uploadedSite.fileCount) || 1)),
-              decoyCount: Math.max(0, Math.min(50000, Number(uploadedSite.decoyCount) || 0)),
-              liveUrl: truncateString(uploadedSite.liveUrl, 256, `/site/${safeSiteId}/index.html`),
-              status: 'PROTECTED',
-              createdAt: serverTimestamp(),
-              updatedAt: serverTimestamp(),
-            });
-          } catch (fsErr) {
-            handleFirestoreError(fsErr, OperationType.CREATE, docPath);
+      const entries = Object.values(sourceZip.files);
+      for (const entry of entries) {
+        if (entry.dir) continue;
+        const lower = entry.name.toLowerCase();
+        if (lower.endsWith('.html') || lower.endsWith('.htm')) {
+          let htmlStr = await entry.async('string');
+          originalSize += htmlStr.length;
+          if (htmlStr.includes('</head>')) {
+            htmlStr = htmlStr.replace('</head>', `${ANTI_F12_SHIELD}\n</head>`);
+          } else if (htmlStr.includes('<body>')) {
+            htmlStr = htmlStr.replace('<body>', `<body>\n${ANTI_F12_SHIELD}`);
+          } else {
+            htmlStr = `${ANTI_F12_SHIELD}\n${htmlStr}`;
           }
+          if (!entryHtml || lower === 'index.html' || lower.endsWith('/index.html')) {
+            entryHtml = htmlStr;
+          }
+          protectedZip.file(entry.name, htmlStr);
+          sourceFiles.push({ path: entry.name, size: htmlStr.length, isDecoy: false });
+        } else {
+          const bytes = await entry.async('uint8array');
+          originalSize += bytes.byteLength;
+          protectedZip.file(entry.name, bytes);
+          sourceFiles.push({ path: entry.name, size: bytes.byteLength, isDecoy: false });
         }
-        setProgress(100);
-        setUploadStep('Deploying protected live website URL...');
-        await new Promise((r) => setTimeout(r, 300));
-        showToast('Website hosted with GOD_MODE anti-steal protection!');
-        setSelectedFile(null);
-        setSiteTitle('');
-        await fetchSites();
-      } else {
-        throw new Error(data.error || 'Failed to host website');
       }
+
+      if (!entryHtml) {
+        entryHtml = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>${title}</title>${ANTI_F12_SHIELD}</head><body style="background:#090d16;color:#e2e8f0;font-family:sans-serif;padding:40px;text-align:center;"><h1>${title}</h1><p>Website protected under God-Mode Anti-Steal Shield (Zero-API + Firebase).</p></body></html>`;
+        protectedZip.file('index.html', entryHtml);
+        sourceFiles.unshift({ path: 'index.html', size: entryHtml.length, isDecoy: false });
+      }
+
+      setProgress(75);
+      setUploadStep('Generating 128 scrambled Decoy / Junk files...');
+
+      const decoys = generateClientDecoys(128);
+      let decoyTotalBytes = 0;
+      for (const decoy of decoys) {
+        decoyTotalBytes += decoy.size;
+        const junk = `/* GOD_MODE_DECOY_JUNK_0x${Math.random().toString(36).slice(2)} */\nconst _0x${Math.random().toString(36).slice(2)} = "${Math.random().toString(36).repeat(4)}";\n`;
+        protectedZip.file(decoy.path, junk);
+      }
+
+      const allFiles = [...sourceFiles, ...decoys];
+      const protectedSize = originalSize + decoyTotalBytes;
+      const randHex = Array.from({ length: 12 }, () => Math.floor(Math.random() * 16).toString(16).toUpperCase()).join('');
+      const accessKey = `GMV3-${randHex.slice(0, 4)}-${randHex.slice(4, 8)}-${randHex.slice(8, 12)}`;
+
+      const siteRecord: HostedSite = {
+        siteId,
+        title,
+        accessKey,
+        originalSize,
+        protectedSize,
+        fileCount: allFiles.length,
+        decoyCount: decoys.length,
+        liveUrl: `/site/${siteId}/index.html`,
+        createdAt: Date.now(),
+        files: allFiles,
+      };
+
+      siteBundlesRef.current.set(siteId, protectedZip);
+      sitePreviewHtmlRef.current.set(siteId, entryHtml);
+
+      if (authReady && user && user.emailVerified && profileSynced) {
+        const uid = sanitizeFirestoreId(user.uid, 'user_default', 128);
+        const safeSiteId = sanitizeFirestoreId(siteId, 'site_001', 64);
+        const docPath = `users/${uid}/vault_deployments/${safeSiteId}`;
+        try {
+          await setDoc(doc(db, 'users', uid, 'vault_deployments', safeSiteId), {
+            ownerId: uid,
+            siteId: safeSiteId,
+            title: truncateString(title, 120, 'Protected Site'),
+            accessKey,
+            originalSize,
+            protectedSize,
+            fileCount: Math.max(1, Math.min(50000, allFiles.length)),
+            decoyCount: Math.max(0, Math.min(50000, decoys.length)),
+            liveUrl: `/site/${safeSiteId}/index.html`,
+            status: 'PROTECTED',
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+        } catch (fsErr) {
+          handleFirestoreError(fsErr, OperationType.CREATE, docPath);
+        }
+      }
+
+      setProgress(100);
+      setUploadStep('Deployment locked & synced!');
+      const nextSites = [siteRecord, ...sites];
+      setSites(nextSites);
+      persistLocalSites(nextSites);
+      showToast(
+        user && profileSynced
+          ? 'Website protected & synced to Firebase Firestore!'
+          : 'Website protected in-browser (Zero-API mode)!'
+      );
+      setSelectedFile(null);
+      setSiteTitle('');
     } catch (err: any) {
-      showToast(err.message || 'Upload error', 'error');
+      showToast(err.message || 'ZIP processing error', 'error');
     } finally {
       setUploading(false);
       setUploadStep('');
@@ -279,8 +394,12 @@ export default function ZipHostVault() {
     if (!confirm(`Are you sure you want to delete hosted site "${title}"?`)) return;
 
     try {
-      const res = await fetch(`/api/zip-host/site/${siteId}`, { method: 'DELETE' });
-      const data = await res.json();
+      siteBundlesRef.current.delete(siteId);
+      sitePreviewHtmlRef.current.delete(siteId);
+      const nextSites = sites.filter((s) => s.siteId !== siteId);
+      setSites(nextSites);
+      persistLocalSites(nextSites);
+
       if (authReady && user && user.emailVerified && profileSynced) {
         const uid = sanitizeFirestoreId(user.uid, 'user_default', 128);
         const safeSiteId = sanitizeFirestoreId(siteId, 'site_001', 64);
@@ -291,69 +410,111 @@ export default function ZipHostVault() {
           handleFirestoreError(fsErr, OperationType.DELETE, docPath);
         }
       }
-      if (data.success || cloudSites.some((c) => c.siteId === siteId)) {
-        showToast(`Deleted hosted site "${title}".`);
-        if (inspectSite?.siteId === siteId) {
-          setInspectSite(null);
-        }
-        await fetchSites();
-      }
+
+      showToast(`Deleted hosted site "${title}".`);
+      if (inspectSite?.siteId === siteId) setInspectSite(null);
     } catch {
       showToast('Failed to delete site.', 'error');
     }
   };
 
   const handleReprotect = async (siteId: string) => {
+    const target = mergedSites.find((s) => s.siteId === siteId);
+    if (!target) return;
     try {
-      showToast('Adding additional scrambled decoy files...', 'info');
-      const res = await fetch(`/api/zip-host/reprotect/${siteId}`, { method: 'POST' });
-      const data = await res.json();
-      if (data.success) {
-        if (authReady && user && user.emailVerified && profileSynced && data.site && cloudSites.some((c) => c.siteId === siteId)) {
-          const updatedSite: HostedSite = data.site;
-          const uid = sanitizeFirestoreId(user.uid, 'user_default', 128);
-          const safeSiteId = sanitizeFirestoreId(siteId, 'site_001', 64);
-          const docPath = `users/${uid}/vault_deployments/${safeSiteId}`;
-          const origSize = Math.max(0, Number(updatedSite.originalSize) || 0);
-          const protSize = Math.max(origSize, Number(updatedSite.protectedSize) || origSize);
-          try {
-            await updateDoc(doc(db, 'users', uid, 'vault_deployments', safeSiteId), {
-              protectedSize: protSize,
-              fileCount: Math.max(1, Math.min(50000, Number(updatedSite.fileCount) || 1)),
-              decoyCount: Math.max(0, Math.min(50000, Number(updatedSite.decoyCount) || 0)),
-              updatedAt: serverTimestamp(),
-            });
-          } catch (fsErr) {
-            handleFirestoreError(fsErr, OperationType.UPDATE, docPath);
-          }
+      const moreDecoys = generateClientDecoys(120, target.decoyCount);
+      const addedBytes = moreDecoys.reduce((sum, d) => sum + d.size, 0);
+      const existingBundle = siteBundlesRef.current.get(siteId);
+      if (existingBundle) {
+        moreDecoys.forEach((d) => {
+          existingBundle.file(d.path, `/* ADDITIONAL_DECOY */\nvar _0xsec_${Math.random()} = 1;`);
+        });
+      }
+
+      const updatedSite: HostedSite = {
+        ...target,
+        decoyCount: target.decoyCount + moreDecoys.length,
+        fileCount: target.fileCount + moreDecoys.length,
+        protectedSize: target.protectedSize + addedBytes,
+        files: [...(target.files || []), ...moreDecoys],
+      };
+
+      const nextSites = [updatedSite, ...sites.filter((s) => s.siteId !== siteId)];
+      setSites(nextSites);
+      persistLocalSites(nextSites);
+
+      if (authReady && user && user.emailVerified && profileSynced && cloudSites.some((c) => c.siteId === siteId)) {
+        const uid = sanitizeFirestoreId(user.uid, 'user_default', 128);
+        const safeSiteId = sanitizeFirestoreId(siteId, 'site_001', 64);
+        const docPath = `users/${uid}/vault_deployments/${safeSiteId}`;
+        try {
+          await updateDoc(doc(db, 'users', uid, 'vault_deployments', safeSiteId), {
+            protectedSize: updatedSite.protectedSize,
+            fileCount: Math.max(1, Math.min(50000, updatedSite.fileCount)),
+            decoyCount: Math.max(0, Math.min(50000, updatedSite.decoyCount)),
+            updatedAt: serverTimestamp(),
+          });
+        } catch (fsErr) {
+          handleFirestoreError(fsErr, OperationType.UPDATE, docPath);
         }
-        showToast('+120 More Decoy files injected successfully!');
-        await fetchSites();
-        if (inspectSite?.siteId === siteId) {
-          openInspector(inspectSite);
-        }
+      }
+
+      showToast('+120 More Decoy files injected successfully!');
+      if (inspectSite?.siteId === siteId) {
+        setInspectFiles(updatedSite.files);
       }
     } catch {
       showToast('Failed to refresh protection.', 'error');
     }
   };
 
+  const handleDownloadProtected = async (site: HostedSite) => {
+    try {
+      let bundle = siteBundlesRef.current.get(site.siteId);
+      if (!bundle) {
+        bundle = new JSZip();
+        const fallbackHtml =
+          sitePreviewHtmlRef.current.get(site.siteId) ||
+          `<!DOCTYPE html><html><head><meta charset="utf-8"><title>${site.title}</title>${ANTI_F12_SHIELD}</head><body style="background:#090d16;color:#e2e8f0;font-family:sans-serif;padding:40px;text-align:center;"><h1>${site.title}</h1><p>God-Mode Key: ${getGodModeKey(site)}</p></body></html>`;
+        bundle.file('index.html', fallbackHtml);
+        generateClientDecoys(Math.max(120, Math.min(240, site.decoyCount))).forEach((d) => {
+          bundle!.file(d.path, `/* GOD_MODE_DECOY_SHARD */\nconst _0x = "${d.path}";`);
+        });
+      }
+      const blob = await bundle.generateAsync({ type: 'blob' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${site.title.replace(/[^a-zA-Z0-9_-]/g, '_')}-GodMode-Protected.zip`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      showToast('Protected ZIP archive downloaded!');
+    } catch {
+      showToast('Failed to generate protected ZIP.', 'error');
+    }
+  };
+
+  const handleOpenPreview = (site: HostedSite) => {
+    const html =
+      sitePreviewHtmlRef.current.get(site.siteId) ||
+      `<!DOCTYPE html><html><head><meta charset="utf-8"><title>${site.title}</title></head><body style="margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#030712;color:#e2e8f0;font-family:monospace;text-align:center;padding:32px;"><div><h1 style="color:#fbbf24;margin-bottom:8px;">${site.title}</h1><p style="color:#94a3b8;font-size:13px;">Protected Site ID: ${site.siteId} • ${site.decoyCount} Decoys Active</p><p style="color:#34d399;font-size:12px;">God-Mode Key: ${getGodModeKey(site)}</p></div></body></html>`;
+    setPreviewSite({ title: site.title, html });
+  };
+
   const openInspector = async (site: HostedSite) => {
     setInspectSite(site);
     setLoadingFiles(true);
-    try {
-      const res = await fetch(`/api/zip-host/files/${site.siteId}`);
-      const data = await res.json();
-      if (data.success && Array.isArray(data.files)) {
-        setInspectFiles(data.files);
-      } else {
-        setInspectFiles([]);
-      }
-    } catch {
-      showToast('Failed to load site file list.', 'error');
-    } finally {
-      setLoadingFiles(false);
-    }
+    const localFiles =
+      site.files && site.files.length > 0
+        ? site.files
+        : [
+            { path: 'index.html', size: site.originalSize || 2048, isDecoy: false },
+            ...generateClientDecoys(Math.min(128, site.decoyCount || 128)),
+          ];
+    setInspectFiles(localFiles);
+    setLoadingFiles(false);
   };
 
   const copyLiveUrl = (url: string, id: string) => {
@@ -585,15 +746,14 @@ export default function ZipHostVault() {
                   </div>
 
                   <div className="flex flex-wrap items-center gap-2">
-                    <a
-                      href={site.liveUrl}
-                      target="_blank"
-                      rel="noreferrer"
+                    <button
+                      type="button"
+                      onClick={() => handleOpenPreview(site)}
                       className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-xs font-bold font-mono flex items-center gap-1.5 cursor-pointer shadow-lg shadow-emerald-600/20"
                     >
                       <ExternalLink className="w-3.5 h-3.5" />
                       Live Preview
-                    </a>
+                    </button>
 
                     <button
                       onClick={() => copyLiveUrl(site.liveUrl, site.siteId)}
@@ -612,14 +772,15 @@ export default function ZipHostVault() {
                       )}
                     </button>
 
-                    <a
-                      href={`/api/zip-host/download-protected/${site.siteId}`}
+                    <button
+                      type="button"
+                      onClick={() => handleDownloadProtected(site)}
                       className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg text-xs font-bold font-mono flex items-center gap-1.5 cursor-pointer"
                       title="Download full zip with all 120+ decoys injected"
                     >
                       <Download className="w-3.5 h-3.5 text-indigo-400" />
                       Download Protected ZIP
-                    </a>
+                    </button>
 
                     <button
                       onClick={() => handleReprotect(site.siteId)}
@@ -779,6 +940,32 @@ export default function ZipHostVault() {
                 Close Inspector
               </button>
             </div>
+          </div>
+        </div>
+      )}
+      {/* SANDBOX LIVE PREVIEW MODAL */}
+      {previewSite && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/85 backdrop-blur-sm">
+          <div className="bg-[#0d1322] border border-slate-800 rounded-2xl p-4 max-w-4xl w-full h-[80vh] flex flex-col gap-3">
+            <div className="flex items-center justify-between border-b border-slate-800 pb-2.5">
+              <div className="flex items-center gap-2 font-mono text-xs text-white font-bold">
+                <Shield className="w-4 h-4 text-emerald-400" />
+                <span>Sandboxed Protected Preview: {previewSite.title}</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setPreviewSite(null)}
+                className="px-3 py-1 bg-slate-800 hover:bg-slate-700 text-white rounded-lg text-xs font-mono cursor-pointer"
+              >
+                Close
+              </button>
+            </div>
+            <iframe
+              title={`Preview ${previewSite.title}`}
+              sandbox="allow-scripts"
+              srcDoc={previewSite.html}
+              className="flex-1 w-full rounded-xl border border-slate-800 bg-white"
+            />
           </div>
         </div>
       )}

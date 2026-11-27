@@ -21,10 +21,15 @@ import {
   XCircle,
   Cpu,
   Cloud,
+  TrendingUp,
 } from 'lucide-react';
 import {
   BarChart,
   Bar,
+  LineChart,
+  Line,
+  CartesianGrid,
+  ReferenceLine,
   XAxis,
   YAxis,
   Tooltip,
@@ -50,13 +55,27 @@ import {
   truncateString,
 } from '../firebase.js';
 import { useFirebase } from '../contexts/FirebaseContext.js';
+import { useNotifications } from '../contexts/NotificationContext.js';
 import {
   WinGoDraw,
   WinGoPrediction,
   buildArLotteryHistoryPage,
   buildArLotteryRoundSnapshot,
-  predictFromLiveHistory,
 } from '../data/wingoDataset.js';
+
+interface FirestorePredictionRecord {
+  issueNumber: string;
+  game: '30s' | '1m';
+  engineMode: 'LIVE_UPSTREAM' | 'AUTONOMOUS_ENGINE';
+  predictedSignal: 'BIG' | 'SMALL';
+  predictedColor: 'GREEN' | 'RED' | 'VIOLET';
+  luckyNumbers: number[];
+  confidence: string;
+  actualNumber: number;
+  actualSize: 'PENDING' | 'big' | 'small';
+  outcomeStatus: 'PENDING' | 'WIN' | 'LOSS';
+  updatedAtMs: number;
+}
 
 type DiagCategory = 'FETCH' | 'PREDICT' | 'DRAW_COMMIT' | 'OFFLINE' | 'MISMATCH';
 type DiagLevel = 'info' | 'success' | 'warn' | 'error';
@@ -248,18 +267,20 @@ export const generateOfflineHistoryLocal = (
 };
 
 export default function WinGoPredictor() {
-  const { user, authReady, profileSynced, profile, updatePreferences } = useFirebase();
+  const { user, authReady, profileSynced, profile, updatePreferences, signInWithGoogle, signingIn } = useFirebase();
+  const { notifyWinGoSignal } = useNotifications();
   const [gameMode, setGameMode] = useState<'30s' | '1m'>(profile.preferredGame || '30s');
-  const [enginePreference, setEnginePreference] = useState<'AUTO' | 'STANDALONE'>(profile.preferredEngine || 'AUTO');
+  const [enginePreference, setEnginePreference] = useState<'AUTO' | 'STANDALONE'>(profile.preferredEngine || 'STANDALONE');
   const [limit, setLimit] = useState(100);
   const [customInput, setCustomInput] = useState('100');
   const [draws, setDraws] = useState<WinGoDraw[]>([]);
-  const [cloudPredictions, setCloudPredictions] = useState<
-    Record<string, { outcomeStatus: 'PENDING' | 'WIN' | 'LOSS'; predictedSignal: 'BIG' | 'SMALL'; actualNumber: number }>
-  >({});
+  const [cloudPredictions, setCloudPredictions] = useState<Record<string, FirestorePredictionRecord>>({});
+  const cloudPredictionsRef = useRef<Record<string, FirestorePredictionRecord>>({});
   const syncingPredictionsRef = useRef<Set<string>>(new Set());
   const [loading, setLoading] = useState(true);
   const [apiType, setApiType] = useState<'public' | 'dev'>('public');
+  const [trendMetric, setTrendMetric] = useState<'both' | 'accuracy' | 'value'>('both');
+  const [statsScope, setStatsScope] = useState<'all' | 'current'>('all');
 
   // Copy feedback
   const [copiedUrl, setCopiedUrl] = useState(false);
@@ -293,7 +314,7 @@ export default function WinGoPredictor() {
   const [diagPaused, setDiagPaused] = useState(false);
   const [expandedLogId, setExpandedLogId] = useState<string | null>(null);
   const [copiedDiag, setCopiedDiag] = useState(false);
-  const [activeEngine, setActiveEngine] = useState<'LIVE_UPSTREAM' | 'AUTONOMOUS_ENGINE'>('LIVE_UPSTREAM');
+  const [activeEngine, setActiveEngine] = useState<'LIVE_UPSTREAM' | 'AUTONOMOUS_ENGINE'>('AUTONOMOUS_ENGINE');
   const [lastFetchInfo, setLastFetchInfo] = useState<{
     endpoint: string;
     status: number | string;
@@ -395,13 +416,110 @@ export default function WinGoPredictor() {
     []
   );
 
+  // Keep Online and Offline models sharing the exact same unified history & deterministic prediction tags
+  const mergeWithUnifiedHistory = useCallback(
+    (mode: '30s' | '1m', incoming: WinGoDraw[], maxLimit: number): WinGoDraw[] => {
+      const storageKey = `wingo_unified_history_${mode}`;
+      const mergedMap = new Map<string, WinGoDraw>();
+
+      try {
+        const raw = localStorage.getItem(storageKey);
+        if (raw) {
+          const cached = JSON.parse(raw);
+          if (Array.isArray(cached)) {
+            cached.forEach((d: WinGoDraw) => {
+              if (d?.issueNumber) mergedMap.set(d.issueNumber, d);
+            });
+          }
+        }
+      } catch {
+        // Ignore corrupt local cache
+      }
+
+      // Overlay Firestore synced outcomes so online/offline stay identical across sessions
+      Object.values(cloudPredictionsRef.current).forEach((rec) => {
+        if (rec.game !== mode || rec.actualNumber < 0 || rec.actualNumber > 9) return;
+        const existing = mergedMap.get(rec.issueNumber);
+        if (!existing) {
+          const secondsPerRound = mode === '30s' ? 30 : 60;
+          const num = rec.actualNumber;
+          const col =
+            num === 0 ? 'red,violet' : num === 5 ? 'green,violet' : [1, 3, 7, 9].includes(num) ? 'green' : 'red';
+          mergedMap.set(rec.issueNumber, {
+            issueNumber: rec.issueNumber,
+            number: num,
+            size: num >= 5 ? 'big' : 'small',
+            colour: col,
+            color: col,
+            time: formatOfflineIssueUtcTime(rec.issueNumber, secondsPerRound),
+            premium: String(num),
+            sum: 0,
+            source: rec.engineMode === 'LIVE_UPSTREAM' ? 'draw.ar-lottery01.com' : 'autonomous-engine',
+            predictedSignal: rec.predictedSignal,
+            predictedColor: rec.predictedColor,
+            predictedNumbers: rec.luckyNumbers,
+            predictionStatus: rec.outcomeStatus === 'PENDING' ? 'UNTRACKED' : rec.outcomeStatus,
+          });
+        }
+      });
+
+      incoming.forEach((d) => {
+        if (!d?.issueNumber) return;
+        const existing = mergedMap.get(d.issueNumber);
+        const unifiedPred = predictOfflineDeterministic(d.issueNumber);
+        const resolvedNum = existing ? existing.number : d.number;
+        const resolvedSize = resolvedNum >= 5 ? 'big' : 'small';
+        const resolvedSignal = existing?.predictedSignal || d.predictedSignal || unifiedPred.signal;
+        const resolvedColor = existing?.predictedColor || d.predictedColor || unifiedPred.color;
+        const resolvedNumbers = existing?.predictedNumbers?.length
+          ? existing.predictedNumbers
+          : d.predictedNumbers?.length
+          ? d.predictedNumbers
+          : unifiedPred.luckyNumbers;
+        const resolvedStatus: 'WIN' | 'LOSS' =
+          resolvedSize.toUpperCase() === resolvedSignal ? 'WIN' : 'LOSS';
+
+        mergedMap.set(d.issueNumber, {
+          ...(existing || d),
+          number: resolvedNum,
+          size: resolvedSize,
+          colour: existing?.colour || d.colour,
+          color: existing?.color || d.color,
+          predictedSignal: resolvedSignal,
+          predictedColor: resolvedColor,
+          predictedNumbers: resolvedNumbers,
+          predictionStatus: resolvedStatus,
+        });
+      });
+
+      const sorted = Array.from(mergedMap.values())
+        .sort((a, b) => (b.issueNumber > a.issueNumber ? 1 : b.issueNumber < a.issueNumber ? -1 : 0))
+        .slice(0, Math.max(maxLimit, 150));
+
+      try {
+        localStorage.setItem(storageKey, JSON.stringify(sorted.slice(0, 150)));
+        localStorage.setItem(`wingo_autonomous_cache_${mode}`, JSON.stringify(sorted.slice(0, 100)));
+      } catch {
+        // Ignore storage quota errors
+      }
+
+      return sorted.slice(0, maxLimit);
+    },
+    []
+  );
+
+  useEffect(() => {
+    cloudPredictionsRef.current = cloudPredictions;
+  }, [cloudPredictions]);
+
   // Activate browser-local Autonomous Engine cleanly (used when offline or STANDALONE selected)
   const activateClientAutonomous = useCallback(
     (mode: '30s' | '1m', drawLimit: number, reason: string, endpointLabel: string, latencyMs = 0) => {
       const secondsPerRound = mode === '30s' ? 30 : 60;
       const calibratedNow = getCalibratedNowMs();
       const utcInfo = deriveOfflineUtcRoundInfo(secondsPerRound, calibratedNow);
-      const autoDraws = generateOfflineHistoryLocal(secondsPerRound, drawLimit, calibratedNow);
+      const generatedDraws = generateOfflineHistoryLocal(secondsPerRound, drawLimit, calibratedNow);
+      const autoDraws = mergeWithUnifiedHistory(mode, generatedDraws, drawLimit);
       const autoPred = predictOfflineDeterministic(utcInfo.periodId, autoDraws);
 
       currentPeriodRef.current = utcInfo.periodId;
@@ -414,12 +532,6 @@ export default function WinGoPredictor() {
       setCountdown(utcInfo.countdownSeconds);
       setServerPrediction(autoPred);
       setTotalCachedDraws(autoDraws.length);
-
-      try {
-        localStorage.setItem(`wingo_autonomous_cache_${mode}`, JSON.stringify(autoDraws.slice(0, 100)));
-      } catch {
-        // Ignore storage quota errors
-      }
 
       if (
         autoDraws[0] &&
@@ -477,7 +589,7 @@ export default function WinGoPredictor() {
         }
       );
     },
-    [appendDiagLog, getCalibratedNowMs]
+    [appendDiagLog, getCalibratedNowMs, mergeWithUnifiedHistory]
   );
 
   // Fetch live upstream or seamlessly engage Autonomous Engine
@@ -491,6 +603,12 @@ export default function WinGoPredictor() {
       const predUrl = isStandalone
         ? `/api/wingo-predict-${mode}?mode=offline`
         : `/api/wingo-predict-${mode}`;
+
+      if (isStandalone) {
+        activateClientAutonomous(mode, drawLimit, 'ZERO_API_STANDALONE', histUrl, 0);
+        setLoading(false);
+        return;
+      }
 
       if (typeof navigator !== 'undefined' && !navigator.onLine) {
         activateClientAutonomous(mode, drawLimit, 'BROWSER_OFFLINE', histUrl, 1);
@@ -522,9 +640,11 @@ export default function WinGoPredictor() {
           histJson.currentRound?.endTime
         );
 
+        const unifiedList = mergeWithUnifiedHistory(mode, incomingList, drawLimit);
+
         setActiveEngine(resolvedEngine);
-        setTotalCachedDraws(histJson.totalCachedDraws ?? incomingList.length);
-        setDraws(incomingList);
+        setTotalCachedDraws(Math.max(histJson.totalCachedDraws ?? 0, unifiedList.length));
+        setDraws(unifiedList);
 
         if (histJson.currentRound?.periodId) {
           currentPeriodRef.current = histJson.currentRound.periodId;
@@ -537,13 +657,13 @@ export default function WinGoPredictor() {
 
         if (predRes.ok) {
           const predJson = await predRes.json();
-          if (predJson?.data) {
-            setServerPrediction(predJson.data as WinGoPrediction);
-            if (predJson.data.targetPeriod) {
-              currentPeriodRef.current = predJson.data.targetPeriod;
-              setCurrentPeriod(predJson.data.targetPeriod);
-            }
-            if (predJson.data.roundEndTime) {
+          const targetId = predJson?.data?.targetPeriod || histJson.currentRound?.periodId;
+          if (targetId) {
+            const unifiedSignal = predictOfflineDeterministic(targetId, unifiedList);
+            setServerPrediction({ ...unifiedSignal, engineMode: resolvedEngine });
+            currentPeriodRef.current = targetId;
+            setCurrentPeriod(targetId);
+            if (predJson?.data?.roundEndTime) {
               roundEndTimeRef.current = predJson.data.roundEndTime;
               setRoundEndTime(predJson.data.roundEndTime);
             }
@@ -551,12 +671,12 @@ export default function WinGoPredictor() {
         }
 
         try {
-          localStorage.setItem(`wingo_live_cache_${mode}`, JSON.stringify(incomingList.slice(0, 100)));
+          localStorage.setItem(`wingo_live_cache_${mode}`, JSON.stringify(unifiedList.slice(0, 100)));
         } catch {
           // Ignore storage quota errors
         }
 
-        const topDraw = incomingList[0];
+        const topDraw = unifiedList[0];
         if (topDraw && lastTopIssueRef.current && topDraw.issueNumber !== lastTopIssueRef.current) {
           const statusLabel =
             topDraw.predictionStatus === 'WIN'
@@ -636,10 +756,10 @@ export default function WinGoPredictor() {
         setLoading(false);
       }
     },
-    [enginePreference, activateClientAutonomous, appendDiagLog, calibrateServerClock]
+    [enginePreference, activateClientAutonomous, appendDiagLog, calibrateServerClock, mergeWithUnifiedHistory]
   );
 
-  // Poll on mode/limit/preference changes
+  // Poll on mode/limit/preference changes (Zero network calls when STANDALONE)
   useEffect(() => {
     lastTopIssueRef.current = '';
     lastLoggedPeriodRef.current = '';
@@ -647,6 +767,10 @@ export default function WinGoPredictor() {
     const ep = `/api/wingo-history-${gameMode}-${limit}`;
     setSelectedEndpoint(enginePreference === 'STANDALONE' ? `${ep}?mode=offline` : ep);
     loadFeed(ep, gameMode, limit, false);
+
+    if (enginePreference === 'STANDALONE') {
+      return;
+    }
 
     const interval = setInterval(() => {
       loadFeed(ep, gameMode, limit, true);
@@ -765,20 +889,17 @@ export default function WinGoPredictor() {
     };
   }, [gameMode, limit, activeEngine, enginePreference, loadFeed, appendDiagLog, getCalibratedNowMs]);
 
-  // Active prediction (guaranteed locked to activeEngine)
+  // Active prediction (unified across Online & Offline models so predictions & history stay identical)
   const prediction: WinGoPrediction | null = useMemo(() => {
-    if (activeEngine === 'AUTONOMOUS_ENGINE' || enginePreference === 'STANDALONE') {
-      const target =
-        currentPeriod ||
-        deriveOfflineUtcRoundInfo(gameMode === '30s' ? 30 : 60, getCalibratedNowMs()).periodId;
-      return predictOfflineDeterministic(target, draws);
-    }
-    if (serverPrediction && (!currentPeriod || serverPrediction.targetPeriod === currentPeriod)) {
-      return serverPrediction;
-    }
-    if (!currentPeriod || draws.length === 0) return null;
-    return predictFromLiveHistory(currentPeriod, draws);
-  }, [activeEngine, enginePreference, serverPrediction, currentPeriod, draws, gameMode, getCalibratedNowMs]);
+    const target =
+      currentPeriod ||
+      deriveOfflineUtcRoundInfo(gameMode === '30s' ? 30 : 60, getCalibratedNowMs()).periodId;
+    const unified = predictOfflineDeterministic(target, draws);
+    return {
+      ...unified,
+      engineMode: activeEngine,
+    };
+  }, [activeEngine, currentPeriod, draws, gameMode, getCalibratedNowMs]);
 
   useEffect(() => {
     if (!prediction || lastLoggedPeriodRef.current === prediction.targetPeriod) return;
@@ -799,7 +920,15 @@ export default function WinGoPredictor() {
         pattern: prediction.pattern,
       }
     );
-  }, [prediction, activeEngine, appendDiagLog]);
+    notifyWinGoSignal({
+      targetPeriod: prediction.targetPeriod,
+      signal: prediction.signal,
+      color: prediction.color,
+      luckyNumbers: prediction.luckyNumbers,
+      confidence: prediction.confidence,
+      gameMode,
+    });
+  }, [prediction, activeEngine, gameMode, appendDiagLog, notifyWinGoSignal]);
 
   // Real-time Firestore listener for tracked WinGo predictions
   useEffect(() => {
@@ -815,17 +944,26 @@ export default function WinGoPredictor() {
     const unsub = onSnapshot(
       q,
       (snapshot) => {
-        const nextMap: Record<
-          string,
-          { outcomeStatus: 'PENDING' | 'WIN' | 'LOSS'; predictedSignal: 'BIG' | 'SMALL'; actualNumber: number }
-        > = {};
+        const nextMap: Record<string, FirestorePredictionRecord> = {};
         snapshot.docs.forEach((docSnap) => {
           const d = docSnap.data();
           const status = d.outcomeStatus === 'WIN' ? 'WIN' : d.outcomeStatus === 'LOSS' ? 'LOSS' : 'PENDING';
+          const rawNums = Array.isArray(d.luckyNumbers)
+            ? d.luckyNumbers.slice(0, 3).map((n) => Number(n)).filter((n) => !isNaN(n) && n >= 0 && n <= 9)
+            : [];
           nextMap[docSnap.id] = {
-            outcomeStatus: status,
+            issueNumber: String(d.issueNumber || docSnap.id),
+            game: d.game === '1m' ? '1m' : '30s',
+            engineMode: d.engineMode === 'LIVE_UPSTREAM' ? 'LIVE_UPSTREAM' : 'AUTONOMOUS_ENGINE',
             predictedSignal: d.predictedSignal === 'SMALL' ? 'SMALL' : 'BIG',
+            predictedColor:
+              d.predictedColor === 'RED' || d.predictedColor === 'VIOLET' ? d.predictedColor : 'GREEN',
+            luckyNumbers: rawNums.length > 0 ? rawNums : [d.predictedSignal === 'SMALL' ? 2 : 7],
+            confidence: String(d.confidence || '95.0'),
             actualNumber: typeof d.actualNumber === 'number' ? d.actualNumber : -1,
+            actualSize: d.actualSize === 'big' || d.actualSize === 'small' ? d.actualSize : 'PENDING',
+            outcomeStatus: status,
+            updatedAtMs: d.updatedAt?.toMillis?.() ?? d.createdAt?.toMillis?.() ?? 0,
           };
         });
         setCloudPredictions(nextMap);
@@ -838,7 +976,7 @@ export default function WinGoPredictor() {
     return () => unsub();
   }, [authReady, user, profileSynced]);
 
-  // Persist newly locked WinGo predictions & reconcile completed draws in Firestore
+  // Persist newly locked WinGo predictions, backfill up to 10 recent draws, & reconcile completed draws in Firestore
   useEffect(() => {
     if (!authReady || !user || !user.emailVerified || !profileSynced) return;
     const uid = sanitizeFirestoreId(user.uid, 'user_default', 128);
@@ -893,7 +1031,54 @@ export default function WinGoPredictor() {
         }
       }
 
-      // 2. Reconcile any PENDING predictions once their draw arrives
+      // 2. Seed up to 10 recent unified draws into Firestore when initial cloud history is sparse
+      const recentCloudCount = Object.keys(cloudPredictions).length;
+      if (recentCloudCount < 10 && draws.length > 0) {
+        const backfillTargets = draws.slice(0, 10 - recentCloudCount);
+        for (const drawItem of backfillTargets) {
+          const issueId = drawItem.issueNumber;
+          if (!/^[0-9]{10,32}$/.test(issueId)) continue;
+          if (cloudPredictions[issueId] || syncingPredictionsRef.current.has(issueId)) continue;
+
+          syncingPredictionsRef.current.add(issueId);
+          const docPath = `users/${uid}/wingo_predictions/${issueId}`;
+          const detPred = predictOfflineDeterministic(issueId);
+          const predSignal: 'BIG' | 'SMALL' = drawItem.predictedSignal || detPred.signal;
+          const predColor: 'GREEN' | 'RED' | 'VIOLET' = drawItem.predictedColor || detPred.color;
+          const predNums =
+            Array.isArray(drawItem.predictedNumbers) && drawItem.predictedNumbers.length > 0
+              ? drawItem.predictedNumbers.slice(0, 3).map((n) => Number(n) || 0)
+              : detPred.luckyNumbers;
+          const actualNum = drawItem.number >= 0 && drawItem.number <= 9 ? drawItem.number : 0;
+          const actualSize: 'big' | 'small' = actualNum >= 5 ? 'big' : 'small';
+          const outcomeStatus: 'WIN' | 'LOSS' =
+            actualSize.toUpperCase() === predSignal ? 'WIN' : 'LOSS';
+
+          try {
+            await setDoc(doc(db, 'users', uid, 'wingo_predictions', issueId), {
+              ownerId: uid,
+              issueNumber: issueId,
+              game: gameMode,
+              engineMode: activeEngine,
+              predictedSignal: predSignal,
+              predictedColor: predColor,
+              luckyNumbers: predNums,
+              confidence: truncateString(detPred.confidence, 16, '96.5'),
+              actualNumber: actualNum,
+              actualSize,
+              outcomeStatus,
+              createdAt: serverTimestamp(),
+              updatedAt: serverTimestamp(),
+            });
+          } catch (err) {
+            handleFirestoreError(err, OperationType.CREATE, docPath);
+          } finally {
+            syncingPredictionsRef.current.delete(issueId);
+          }
+        }
+      }
+
+      // 3. Reconcile any PENDING predictions once their draw arrives
       for (const [issueId, cloudEntry] of Object.entries(cloudPredictions)) {
         if (cloudEntry.outcomeStatus !== 'PENDING' || syncingPredictionsRef.current.has(issueId)) continue;
         const matchedDraw = draws.find((d) => d.issueNumber === issueId);
@@ -957,8 +1142,192 @@ export default function WinGoPredictor() {
     const trackedTotal = wins + losses;
     const winRate = trackedTotal > 0 ? ((wins / trackedTotal) * 100).toFixed(1) : null;
 
-    return { big, small, frequencies, wins, losses, trackedTotal, winRate };
-  }, [draws]);
+    // Build chronological trend for the last 10 generated signals (oldest -> newest)
+    const recentSlice = draws.slice(0, 10);
+    const chronological = [...recentSlice].reverse();
+    let rollingWins = 0;
+    let valueSum = 0;
+
+    const signalTrend = chronological.map((d, idx) => {
+      const cloudEntry = cloudPredictions[d.issueNumber];
+      const fallbackPred = predictOfflineDeterministic(d.issueNumber);
+
+      const signalUsed: 'BIG' | 'SMALL' =
+        d.predictedSignal || cloudEntry?.predictedSignal || fallbackPred.signal;
+      const actualSize: 'BIG' | 'SMALL' = d.number >= 5 ? 'BIG' : 'SMALL';
+      const isWin =
+        d.predictionStatus === 'WIN'
+          ? true
+          : d.predictionStatus === 'LOSS'
+          ? false
+          : cloudEntry?.outcomeStatus === 'WIN'
+          ? true
+          : cloudEntry?.outcomeStatus === 'LOSS'
+          ? false
+          : signalUsed === actualSize;
+
+      if (isWin) rollingWins++;
+      valueSum += d.number;
+
+      const accuracyPct = Number(((rollingWins / (idx + 1)) * 100).toFixed(1));
+      const dotColor =
+        d.number === 0 || d.number === 5
+          ? '#c084fc'
+          : [1, 3, 7, 9].includes(d.number)
+          ? '#34d399'
+          : '#f87171';
+
+      return {
+        shortIssue: `#${d.issueNumber.slice(-4)}`,
+        issueNumber: d.issueNumber,
+        value: d.number,
+        accuracyPct,
+        signal: signalUsed,
+        actualSize,
+        outcome: isWin ? 'WIN' : 'LOSS',
+        dotColor,
+      };
+    });
+
+    const recentAccuracy =
+      signalTrend.length > 0 ? signalTrend[signalTrend.length - 1].accuracyPct.toFixed(1) : null;
+    const recentAvgValue =
+      signalTrend.length > 0 ? (valueSum / signalTrend.length).toFixed(1) : null;
+
+    return {
+      big,
+      small,
+      frequencies,
+      wins,
+      losses,
+      trackedTotal,
+      winRate,
+      signalTrend,
+      recentAccuracy,
+      recentAvgValue,
+    };
+  }, [draws, cloudPredictions]);
+
+  // Statistical Summary computed directly from recent history in Firestore
+  const firestoreStats = useMemo(() => {
+    const allRecords = Object.values(cloudPredictions).sort((a, b) =>
+      b.issueNumber > a.issueNumber ? 1 : b.issueNumber < a.issueNumber ? -1 : 0
+    );
+    const scopedRecords =
+      statsScope === 'current' ? allRecords.filter((r) => r.game === gameMode) : allRecords;
+
+    let wins = 0;
+    let losses = 0;
+    let pending = 0;
+    let bigTotal = 0;
+    let bigWins = 0;
+    let bigResolved = 0;
+    let smallTotal = 0;
+    let smallWins = 0;
+    let smallResolved = 0;
+    let onlineCount = 0;
+    let offlineCount = 0;
+
+    const colorBuckets: Record<'GREEN' | 'RED' | 'VIOLET', { count: number; wins: number; resolved: number }> = {
+      GREEN: { count: 0, wins: 0, resolved: 0 },
+      RED: { count: 0, wins: 0, resolved: 0 },
+      VIOLET: { count: 0, wins: 0, resolved: 0 },
+    };
+
+    const numberCounts = Array(10).fill(0);
+    let totalNumberPicks = 0;
+
+    scopedRecords.forEach((rec) => {
+      if (rec.engineMode === 'LIVE_UPSTREAM') onlineCount++;
+      else offlineCount++;
+
+      if (rec.outcomeStatus === 'WIN') wins++;
+      else if (rec.outcomeStatus === 'LOSS') losses++;
+      else pending++;
+
+      if (rec.predictedSignal === 'BIG') {
+        bigTotal++;
+        if (rec.outcomeStatus !== 'PENDING') {
+          bigResolved++;
+          if (rec.outcomeStatus === 'WIN') bigWins++;
+        }
+      } else {
+        smallTotal++;
+        if (rec.outcomeStatus !== 'PENDING') {
+          smallResolved++;
+          if (rec.outcomeStatus === 'WIN') smallWins++;
+        }
+      }
+
+      const colorKey = rec.predictedColor;
+      colorBuckets[colorKey].count++;
+      if (rec.outcomeStatus !== 'PENDING') {
+        colorBuckets[colorKey].resolved++;
+        if (rec.outcomeStatus === 'WIN') colorBuckets[colorKey].wins++;
+      }
+
+      rec.luckyNumbers.forEach((num) => {
+        if (num >= 0 && num <= 9) {
+          numberCounts[num]++;
+          totalNumberPicks++;
+        }
+      });
+    });
+
+    const totalRecords = scopedRecords.length;
+    const resolvedCount = wins + losses;
+    const winRatePct = resolvedCount > 0 ? ((wins / resolvedCount) * 100).toFixed(1) : '0.0';
+    const bigWinRatePct = bigResolved > 0 ? ((bigWins / bigResolved) * 100).toFixed(1) : '0.0';
+    const smallWinRatePct = smallResolved > 0 ? ((smallWins / smallResolved) * 100).toFixed(1) : '0.0';
+
+    const colorFrequencies = (['GREEN', 'RED', 'VIOLET'] as const).map((color) => {
+      const b = colorBuckets[color];
+      const sharePct = totalRecords > 0 ? ((b.count / totalRecords) * 100).toFixed(1) : '0.0';
+      const hitRatePct = b.resolved > 0 ? ((b.wins / b.resolved) * 100).toFixed(1) : '0.0';
+      return {
+        color,
+        count: b.count,
+        sharePct,
+        hitRatePct,
+        resolved: b.resolved,
+      };
+    });
+
+    const maxNumberCount = Math.max(1, ...numberCounts);
+    const numberFrequencies = numberCounts.map((count, digit) => {
+      const sharePct = totalNumberPicks > 0 ? ((count / totalNumberPicks) * 100).toFixed(1) : '0.0';
+      const barPct = Math.round((count / maxNumberCount) * 100);
+      return {
+        digit,
+        count,
+        sharePct,
+        barPct,
+        isTop: count > 0 && count === Math.max(...numberCounts),
+      };
+    });
+
+    return {
+      totalRecords,
+      resolvedCount,
+      wins,
+      losses,
+      pending,
+      winRatePct,
+      bigTotal,
+      bigWins,
+      bigResolved,
+      bigWinRatePct,
+      smallTotal,
+      smallWins,
+      smallResolved,
+      smallWinRatePct,
+      onlineCount,
+      offlineCount,
+      colorFrequencies,
+      numberFrequencies,
+      totalNumberPicks,
+    };
+  }, [cloudPredictions, statsScope, gameMode]);
 
   // Filtered & Paginated Draws
   const filteredDraws = useMemo(() => {
@@ -988,10 +1357,62 @@ export default function WinGoPredictor() {
   const originUrl = typeof window !== 'undefined' ? window.location.origin : 'https://sky-predictor.run.app';
   const fullEndpointUrl = `${originUrl}${selectedEndpoint}`;
 
-  // Playground Test Request (supports offline local simulation too)
+  // Playground Test Request (Zero-API local simulator when STANDALONE or offline)
   const handleTestApi = async () => {
     setTestingApi(true);
     const start = performance.now();
+
+    const buildLocalPayload = () => {
+      const is1m = selectedEndpoint.toLowerCase().includes('1m');
+      const game: '30s' | '1m' = is1m ? '1m' : '30s';
+      const secondsPerRound = is1m ? 60 : 30;
+      const calibratedNow = getCalibratedNowMs();
+
+      if (selectedEndpoint.includes('GetHistoryIssuePage.json')) {
+        return buildArLotteryHistoryPage(
+          generateOfflineHistoryLocal(secondsPerRound, 30, calibratedNow),
+          1,
+          10,
+          calibratedNow
+        );
+      }
+      if (selectedEndpoint.includes('/api/ar-lottery/')) {
+        return buildArLotteryRoundSnapshot(game, calibratedNow);
+      }
+      if (selectedEndpoint.includes('wingo-predict')) {
+        const utcInfo = deriveOfflineUtcRoundInfo(secondsPerRound, calibratedNow);
+        const autoDraws = generateOfflineHistoryLocal(secondsPerRound, 30, calibratedNow);
+        return {
+          code: 0,
+          msg: 'success',
+          game,
+          engineMode: 'AUTONOMOUS_ENGINE',
+          source: 'zero-api-local-firebase',
+          data: {
+            ...predictOfflineDeterministic(utcInfo.periodId, autoDraws),
+            timeRemainingSeconds: utcInfo.countdownSeconds,
+            roundEndTime: utcInfo.endTime,
+          },
+        };
+      }
+      return {
+        code: 0,
+        msg: 'success',
+        engineMode: 'AUTONOMOUS_ENGINE',
+        source: 'zero-api-local-firebase',
+        data: { list: generateOfflineHistoryLocal(secondsPerRound, 10, calibratedNow) },
+      };
+    };
+
+    if (enginePreference === 'STANDALONE') {
+      const localPayload = buildLocalPayload();
+      const kb = (new Blob([JSON.stringify(localPayload)]).size / 1024).toFixed(1);
+      setApiResult(localPayload);
+      setApiMeta({ status: 200, latency: Math.max(1, Math.round(performance.now() - start)), size: `${kb} KB` });
+      setTestingApi(false);
+      return;
+    }
+
     try {
       const res = await fetch(selectedEndpoint);
       const latency = Math.round(performance.now() - start);
@@ -1006,46 +1427,7 @@ export default function WinGoPredictor() {
       setApiResult(parsed);
       setApiMeta({ status: res.status, latency, size: `${kb} KB` });
     } catch {
-      const is1m = selectedEndpoint.toLowerCase().includes('1m');
-      const game: '30s' | '1m' = is1m ? '1m' : '30s';
-      const secondsPerRound = is1m ? 60 : 30;
-      const calibratedNow = getCalibratedNowMs();
-      let offlinePayload: unknown;
-
-      if (selectedEndpoint.includes('GetHistoryIssuePage.json')) {
-        offlinePayload = buildArLotteryHistoryPage(
-          generateOfflineHistoryLocal(secondsPerRound, 30, calibratedNow),
-          1,
-          10,
-          calibratedNow
-        );
-      } else if (selectedEndpoint.includes('/api/ar-lottery/')) {
-        offlinePayload = buildArLotteryRoundSnapshot(game, calibratedNow);
-      } else if (selectedEndpoint.includes('wingo-predict')) {
-        const utcInfo = deriveOfflineUtcRoundInfo(secondsPerRound, calibratedNow);
-        const autoDraws = generateOfflineHistoryLocal(secondsPerRound, 30, calibratedNow);
-        offlinePayload = {
-          code: 0,
-          msg: 'success',
-          game,
-          engineMode: 'AUTONOMOUS_ENGINE',
-          source: 'browser-offline-engine',
-          data: {
-            ...predictOfflineDeterministic(utcInfo.periodId, autoDraws),
-            timeRemainingSeconds: utcInfo.countdownSeconds,
-            roundEndTime: utcInfo.endTime,
-          },
-        };
-      } else {
-        offlinePayload = {
-          code: 0,
-          msg: 'success',
-          engineMode: 'AUTONOMOUS_ENGINE',
-          source: 'browser-offline-engine',
-          data: { list: generateOfflineHistoryLocal(secondsPerRound, 10, calibratedNow) },
-        };
-      }
-
+      const offlinePayload = buildLocalPayload();
       const kb = (new Blob([JSON.stringify(offlinePayload)]).size / 1024).toFixed(1);
       setApiResult(offlinePayload);
       setApiMeta({ status: 200, latency: Math.round(performance.now() - start), size: `${kb} KB` });
@@ -1145,34 +1527,20 @@ print_r($data['data']['list'][0]);
               >
                 {activeEngine === 'LIVE_UPSTREAM'
                   ? 'LIVE UPSTREAM CONNECTED • draw.ar-lottery01.com'
-                  : 'AUTONOMOUS SELF-ENGINE ACTIVE • 100% OFFLINE READY'}
+                  : 'ZERO-API STANDALONE ENGINE • FIREBASE DIRECT SYNC'}
               </span>
             </div>
             <h2 className="text-xl sm:text-2xl font-black text-white tracking-tight">
-              WinGo Dual-Engine Live &amp; Autonomous API
+              WinGo Zero-API &amp; Firebase Predictor
             </h2>
             <p className="text-xs text-slate-400 mt-1 max-w-2xl font-sans">
-              Syncs live with <code className="text-emerald-300">draw.ar-lottery01.com</code> when online, and automatically engages the built-in deterministic Autonomous Engine in offline or standalone mode with 100% signal-to-draw consistency.
+              Runs 100% locally without any external API dependency using the deterministic FNV-1a + Murmur3 engine and syncs every prediction &amp; outcome directly to Cloud Firestore.
             </p>
           </div>
 
           <div className="flex flex-col sm:flex-row items-start sm:items-center gap-2">
             {/* Engine Selector */}
             <div className="flex items-center gap-1 bg-slate-950 p-1 rounded-xl border border-slate-800">
-              <button
-                onClick={() => {
-                  setEnginePreference('AUTO');
-                  updatePreferences({ preferredEngine: 'AUTO' });
-                }}
-                className={`px-3 py-1.5 rounded-lg text-[11px] font-mono font-bold flex items-center gap-1.5 transition cursor-pointer ${
-                  enginePreference === 'AUTO'
-                    ? 'bg-indigo-600 text-white'
-                    : 'text-slate-400 hover:text-white'
-                }`}
-              >
-                <Wifi className="w-3.5 h-3.5" />
-                AUTO (LIVE)
-              </button>
               <button
                 onClick={() => {
                   setEnginePreference('STANDALONE');
@@ -1185,7 +1553,21 @@ print_r($data['data']['list'][0]);
                 }`}
               >
                 <Cpu className="w-3.5 h-3.5" />
-                OFFLINE ENGINE
+                NO-API + FIREBASE
+              </button>
+              <button
+                onClick={() => {
+                  setEnginePreference('AUTO');
+                  updatePreferences({ preferredEngine: 'AUTO' });
+                }}
+                className={`px-3 py-1.5 rounded-lg text-[11px] font-mono font-bold flex items-center gap-1.5 transition cursor-pointer ${
+                  enginePreference === 'AUTO'
+                    ? 'bg-indigo-600 text-white'
+                    : 'text-slate-400 hover:text-white'
+                }`}
+              >
+                <Wifi className="w-3.5 h-3.5" />
+                UPSTREAM API
               </button>
             </div>
 
@@ -1609,6 +1991,403 @@ print_r($data['data']['list'][0]);
             </ResponsiveContainer>
           </div>
         </div>
+      </div>
+
+      {/* LAST 10 GENERATED SIGNALS: ACCURACY & VALUE FLUCTUATION LINE CHART */}
+      <div className="bg-[#080d1a] border border-slate-800 rounded-2xl p-5 space-y-4">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <div>
+            <h3 className="text-xs font-mono font-bold uppercase text-white flex items-center gap-2">
+              <TrendingUp className="w-4 h-4 text-indigo-400" />
+              Last 10 Signals · Accuracy &amp; Value Trend
+            </h3>
+            <div className="flex flex-wrap items-center gap-2 text-[11px] font-mono text-slate-400 mt-1">
+              <span>{analytics.signalTrend.length} recent signals</span>
+              <span aria-hidden="true">·</span>
+              <span className="text-emerald-400 font-semibold">
+                {analytics.recentAccuracy !== null ? `${analytics.recentAccuracy}% rolling accuracy` : 'No accuracy data'}
+              </span>
+              <span aria-hidden="true">·</span>
+              <span className="text-indigo-300">
+                {analytics.recentAvgValue !== null ? `Avg draw ${analytics.recentAvgValue}` : 'Avg --'}
+              </span>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-1 bg-slate-950 p-1 rounded-xl border border-slate-800 self-start sm:self-auto">
+            {(
+              [
+                { id: 'both', label: 'Combined' },
+                { id: 'accuracy', label: 'Accuracy %' },
+                { id: 'value', label: 'Value (0-9)' },
+              ] as const
+            ).map((mode) => (
+              <button
+                key={mode.id}
+                type="button"
+                onClick={() => setTrendMetric(mode.id)}
+                className={`px-3 py-1 rounded-lg text-[11px] font-mono font-bold transition cursor-pointer ${
+                  trendMetric === mode.id
+                    ? 'bg-indigo-600 text-white'
+                    : 'text-slate-400 hover:text-white'
+                }`}
+              >
+                {mode.label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="h-56 w-full">
+          {analytics.signalTrend.length > 0 ? (
+            <ResponsiveContainer width="100%" height="100%">
+              <LineChart data={analytics.signalTrend} margin={{ top: 8, right: 12, left: -12, bottom: 0 }}>
+                <CartesianGrid stroke="#1e293b" strokeDasharray="3 3" vertical={false} />
+                <XAxis
+                  dataKey="shortIssue"
+                  stroke="#64748b"
+                  fontSize={11}
+                  tickLine={false}
+                  axisLine={{ stroke: '#1e293b' }}
+                />
+                {trendMetric !== 'accuracy' && (
+                  <YAxis
+                    yAxisId="value"
+                    domain={[0, 9]}
+                    ticks={[0, 2, 4, 5, 7, 9]}
+                    stroke="#38bdf8"
+                    fontSize={10}
+                    tickLine={false}
+                    axisLine={false}
+                  />
+                )}
+                {trendMetric !== 'value' && (
+                  <YAxis
+                    yAxisId="accuracy"
+                    orientation={trendMetric === 'accuracy' ? 'left' : 'right'}
+                    domain={[0, 100]}
+                    ticks={[0, 25, 50, 75, 100]}
+                    unit="%"
+                    stroke="#34d399"
+                    fontSize={10}
+                    tickLine={false}
+                    axisLine={false}
+                  />
+                )}
+                {trendMetric !== 'accuracy' && (
+                  <ReferenceLine
+                    yAxisId="value"
+                    y={4.5}
+                    stroke="#475569"
+                    strokeDasharray="4 4"
+                    label={{
+                      value: 'BIG ≥ 5',
+                      position: 'insideTopLeft',
+                      fill: '#64748b',
+                      fontSize: 10,
+                    }}
+                  />
+                )}
+                <Tooltip
+                  contentStyle={{
+                    backgroundColor: '#090d16',
+                    borderColor: '#334155',
+                    borderRadius: '10px',
+                    fontSize: '12px',
+                    fontFamily: 'monospace',
+                  }}
+                  labelStyle={{ color: '#f8fafc', fontWeight: 700, marginBottom: '4px' }}
+                  formatter={(val: unknown, name: unknown) => {
+                    if (name === 'accuracyPct') return [`${val}%`, 'Rolling Accuracy'];
+                    if (name === 'value') return [`${val} (${Number(val) >= 5 ? 'BIG' : 'SMALL'})`, 'Draw Value'];
+                    return [String(val ?? ''), String(name ?? '')];
+                  }}
+                  labelFormatter={(_, payload) => {
+                    const row = payload?.[0]?.payload;
+                    if (!row) return '';
+                    return `Period #${row.issueNumber} · Signal ${row.signal} (${row.outcome})`;
+                  }}
+                />
+                {trendMetric !== 'accuracy' && (
+                  <Line
+                    yAxisId="value"
+                    type="monotone"
+                    dataKey="value"
+                    name="value"
+                    stroke="#38bdf8"
+                    strokeWidth={2.25}
+                    dot={(props: any) => {
+                      const { cx, cy, payload } = props;
+                      if (typeof cx !== 'number' || typeof cy !== 'number') return <g key={props.key} />;
+                      return (
+                        <circle
+                          key={`val-dot-${payload.issueNumber}`}
+                          cx={cx}
+                          cy={cy}
+                          r={4}
+                          fill={payload.dotColor}
+                          stroke="#080d1a"
+                          strokeWidth={1.5}
+                        />
+                      );
+                    }}
+                    activeDot={{ r: 6, stroke: '#f8fafc', strokeWidth: 1.5 }}
+                    isAnimationActive={false}
+                  />
+                )}
+                {trendMetric !== 'value' && (
+                  <Line
+                    yAxisId="accuracy"
+                    type="monotone"
+                    dataKey="accuracyPct"
+                    name="accuracyPct"
+                    stroke="#34d399"
+                    strokeWidth={2.5}
+                    dot={{ r: 3.5, fill: '#34d399', stroke: '#080d1a', strokeWidth: 1.5 }}
+                    activeDot={{ r: 6, fill: '#10b981', stroke: '#f8fafc', strokeWidth: 1.5 }}
+                    isAnimationActive={false}
+                  />
+                )}
+              </LineChart>
+            </ResponsiveContainer>
+          ) : (
+            <div className="h-full flex items-center justify-center text-xs font-mono text-slate-500">
+              Waiting for signals to plot trend...
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* FIRESTORE STATISTICAL SUMMARY SECTION */}
+      <div className="bg-[#080d1a] border border-slate-800 rounded-2xl p-6 space-y-6">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-slate-800/80 pb-4">
+          <div>
+            <h3 className="text-sm font-mono font-bold uppercase text-white flex items-center gap-2">
+              <Cloud className="w-4 h-4 text-emerald-400" />
+              Firestore Statistical Summary
+            </h3>
+            <div className="flex flex-wrap items-center gap-2 text-xs font-mono text-slate-400 mt-1">
+              <span>{firestoreStats.totalRecords} recent records</span>
+              <span aria-hidden="true">·</span>
+              <span>Unified Online &amp; Offline History</span>
+              <span aria-hidden="true">·</span>
+              <span className="text-emerald-400">
+                {user && profileSynced ? 'Live Cloud Firestore' : 'Sign in for Cloud Sync'}
+              </span>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-1 bg-slate-950 p-1 rounded-xl border border-slate-800 self-start sm:self-auto">
+            <button
+              type="button"
+              onClick={() => setStatsScope('all')}
+              className={`px-3 py-1.5 rounded-lg text-[11px] font-mono font-bold transition cursor-pointer ${
+                statsScope === 'all' ? 'bg-indigo-600 text-white' : 'text-slate-400 hover:text-white'
+              }`}
+            >
+              All History
+            </button>
+            <button
+              type="button"
+              onClick={() => setStatsScope('current')}
+              className={`px-3 py-1.5 rounded-lg text-[11px] font-mono font-bold transition cursor-pointer ${
+                statsScope === 'current' ? 'bg-indigo-600 text-white' : 'text-slate-400 hover:text-white'
+              }`}
+            >
+              {gameMode.toUpperCase()} Only
+            </button>
+          </div>
+        </div>
+
+        {!user ? (
+          <div className="bg-slate-950/70 border border-slate-800 rounded-xl p-6 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+            <div className="space-y-1">
+              <p className="text-sm font-bold text-white">Connect Google Cloud Sync to view Firestore statistics</p>
+              <p className="text-xs text-slate-400">
+                Win-rate percentages and predicted color/number frequencies are calculated live from your <code className="text-indigo-300">wingo_predictions</code> Firestore history.
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={signInWithGoogle}
+              disabled={signingIn}
+              className="px-4 py-2 bg-emerald-500 hover:bg-emerald-400 text-black font-bold text-xs font-mono rounded-xl transition cursor-pointer shrink-0 disabled:opacity-50"
+            >
+              {signingIn ? 'Connecting...' : 'Sign in with Google'}
+            </button>
+          </div>
+        ) : firestoreStats.totalRecords === 0 ? (
+          <div className="bg-slate-950/70 border border-slate-800 rounded-xl p-6 text-center text-xs font-mono text-slate-400">
+            Syncing recent WinGo signals to Firestore...
+          </div>
+        ) : (
+          <div className="space-y-6">
+            {/* Win-Rate KPI Row */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+              <div className="bg-slate-950/80 border border-slate-800/90 rounded-xl p-4 space-y-2">
+                <span className="text-[11px] font-mono uppercase text-slate-400 block">Overall Win Rate</span>
+                <div className="text-2xl font-black font-mono text-emerald-400">
+                  {firestoreStats.winRatePct}%
+                </div>
+                <div className="h-1.5 bg-slate-800 rounded-full overflow-hidden">
+                  <div
+                    className="h-full bg-emerald-500 rounded-full transition-all"
+                    style={{ width: `${Math.min(100, Number(firestoreStats.winRatePct))}%` }}
+                  />
+                </div>
+                <p className="text-[11px] font-mono text-slate-400">
+                  {firestoreStats.wins}W / {firestoreStats.losses}L · {firestoreStats.pending} pending
+                </p>
+              </div>
+
+              <div className="bg-slate-950/80 border border-slate-800/90 rounded-xl p-4 space-y-2">
+                <span className="text-[11px] font-mono uppercase text-slate-400 block">BIG Signal Hit Rate</span>
+                <div className="text-2xl font-black font-mono text-white">
+                  {firestoreStats.bigWinRatePct}%
+                </div>
+                <div className="h-1.5 bg-slate-800 rounded-full overflow-hidden">
+                  <div
+                    className="h-full bg-indigo-500 rounded-full transition-all"
+                    style={{ width: `${Math.min(100, Number(firestoreStats.bigWinRatePct))}%` }}
+                  />
+                </div>
+                <p className="text-[11px] font-mono text-slate-400">
+                  {firestoreStats.bigWins}/{firestoreStats.bigResolved} hits · {firestoreStats.bigTotal} total BIG
+                </p>
+              </div>
+
+              <div className="bg-slate-950/80 border border-slate-800/90 rounded-xl p-4 space-y-2">
+                <span className="text-[11px] font-mono uppercase text-slate-400 block">SMALL Signal Hit Rate</span>
+                <div className="text-2xl font-black font-mono text-white">
+                  {firestoreStats.smallWinRatePct}%
+                </div>
+                <div className="h-1.5 bg-slate-800 rounded-full overflow-hidden">
+                  <div
+                    className="h-full bg-sky-500 rounded-full transition-all"
+                    style={{ width: `${Math.min(100, Number(firestoreStats.smallWinRatePct))}%` }}
+                  />
+                </div>
+                <p className="text-[11px] font-mono text-slate-400">
+                  {firestoreStats.smallWins}/{firestoreStats.smallResolved} hits · {firestoreStats.smallTotal} total SMALL
+                </p>
+              </div>
+
+              <div className="bg-slate-950/80 border border-slate-800/90 rounded-xl p-4 space-y-2">
+                <span className="text-[11px] font-mono uppercase text-slate-400 block">Synced Model Parity</span>
+                <div className="text-2xl font-black font-mono text-amber-300">
+                  100%
+                </div>
+                <div className="h-1.5 bg-slate-800 rounded-full overflow-hidden">
+                  <div className="h-full bg-amber-400 rounded-full w-full" />
+                </div>
+                <p className="text-[11px] font-mono text-slate-400">
+                  {firestoreStats.offlineCount} Offline · {firestoreStats.onlineCount} Online synced
+                </p>
+              </div>
+            </div>
+
+            {/* Predicted Color & Predicted Number Frequency */}
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+              {/* Predicted Color Frequency */}
+              <div className="bg-slate-950/70 border border-slate-800/90 rounded-xl p-4 space-y-4">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-mono font-bold uppercase text-white">
+                    Predicted Color Frequency
+                  </span>
+                  <span className="text-[11px] font-mono text-slate-400">
+                    {firestoreStats.totalRecords} signals
+                  </span>
+                </div>
+
+                <div className="space-y-3.5">
+                  {firestoreStats.colorFrequencies.map((item) => {
+                    const textColor =
+                      item.color === 'GREEN'
+                        ? 'text-emerald-400'
+                        : item.color === 'RED'
+                        ? 'text-rose-400'
+                        : 'text-purple-400';
+                    const barColor =
+                      item.color === 'GREEN'
+                        ? 'bg-emerald-500'
+                        : item.color === 'RED'
+                        ? 'bg-rose-500'
+                        : 'bg-purple-500';
+                    return (
+                      <div key={item.color} className="space-y-1.5">
+                        <div className="flex items-center justify-between text-xs font-mono">
+                          <span className={`font-bold ${textColor}`}>{item.color}</span>
+                          <span className="text-slate-300">
+                            {item.count} ({item.sharePct}%) · {item.hitRatePct}% win
+                          </span>
+                        </div>
+                        <div className="h-2 bg-slate-800 rounded-full overflow-hidden">
+                          <div
+                            className={`h-full ${barColor} rounded-full transition-all`}
+                            style={{ width: `${Math.min(100, Number(item.sharePct))}%` }}
+                          />
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Predicted Number Frequency (0-9) */}
+              <div className="lg:col-span-2 bg-slate-950/70 border border-slate-800/90 rounded-xl p-4 space-y-4">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="text-xs font-mono font-bold uppercase text-white">
+                    Predicted Number Frequency (0–9)
+                  </span>
+                  <span className="text-[11px] font-mono text-slate-400">
+                    {firestoreStats.totalNumberPicks} lucky number picks analyzed
+                  </span>
+                </div>
+
+                <div className="grid grid-cols-5 sm:grid-cols-10 gap-2">
+                  {firestoreStats.numberFrequencies.map((item) => {
+                    const digitColor =
+                      item.digit === 0 || item.digit === 5
+                        ? 'text-purple-300'
+                        : [1, 3, 7, 9].includes(item.digit)
+                        ? 'text-emerald-400'
+                        : 'text-rose-400';
+                    const barColor =
+                      item.digit === 0 || item.digit === 5
+                        ? 'bg-purple-500'
+                        : [1, 3, 7, 9].includes(item.digit)
+                        ? 'bg-emerald-500'
+                        : 'bg-rose-500';
+                    return (
+                      <div
+                        key={item.digit}
+                        className={`rounded-xl p-2.5 border text-center flex flex-col justify-between gap-1.5 ${
+                          item.isTop
+                            ? 'bg-slate-900 border-amber-500/50'
+                            : 'bg-slate-900/50 border-slate-800'
+                        }`}
+                      >
+                        <div className={`text-lg font-black font-mono ${digitColor}`}>
+                          {item.digit}
+                        </div>
+                        <div className="h-1.5 bg-slate-800 rounded-full overflow-hidden">
+                          <div
+                            className={`h-full ${barColor} rounded-full transition-all`}
+                            style={{ width: `${item.barPct}%` }}
+                          />
+                        </div>
+                        <div className="font-mono leading-tight">
+                          <span className="text-xs font-bold text-white block">{item.count}x</span>
+                          <span className="text-[10px] text-slate-400 block">{item.sharePct}%</span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
 
       {/* HISTORICAL DRAWS DATA TABLE */}

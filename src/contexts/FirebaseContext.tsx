@@ -32,17 +32,19 @@ interface FirebaseContextValue {
   authReady: boolean;
   profileSynced: boolean;
   dbConnected: boolean;
+  firestoreLatencyMs: number;
   signingIn: boolean;
   authError: string | null;
   profile: UserProfileState;
   signInWithGoogle: () => Promise<void>;
   signOutUser: () => Promise<void>;
+  refreshConnection: () => Promise<void>;
   updatePreferences: (prefs: Partial<{ preferredEngine: 'AUTO' | 'STANDALONE'; preferredGame: '30s' | '1m' }>) => Promise<void>;
   updateConnectedGmail: (gmail: string) => Promise<void>;
 }
 
 const DEFAULT_PROFILE: UserProfileState = {
-  preferredEngine: 'AUTO',
+  preferredEngine: 'STANDALONE',
   preferredGame: '30s',
   connectedGmail: 'shaktimahto1213@gmail.com',
 };
@@ -54,19 +56,22 @@ export const FirebaseProvider: React.FC<{ children: React.ReactNode }> = ({ chil
   const [authReady, setAuthReady] = useState(false);
   const [profileSynced, setProfileSynced] = useState(false);
   const [dbConnected, setDbConnected] = useState(false);
+  const [firestoreLatencyMs, setFirestoreLatencyMs] = useState(24);
   const [signingIn, setSigningIn] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
   const [profile, setProfile] = useState<UserProfileState>(DEFAULT_PROFILE);
 
-  useEffect(() => {
-    let mounted = true;
-    testConnection().then((ok) => {
-      if (mounted) setDbConnected(ok);
-    });
-    return () => {
-      mounted = false;
-    };
+  const refreshConnection = useCallback(async () => {
+    const res = await testConnection();
+    setDbConnected(res.connected);
+    setFirestoreLatencyMs(res.latencyMs);
   }, []);
+
+  useEffect(() => {
+    refreshConnection();
+    const timer = setInterval(refreshConnection, 15000);
+    return () => clearInterval(timer);
+  }, [refreshConnection]);
 
   const ensureUserDocuments = useCallback(async (currentUser: User) => {
     if (!currentUser.emailVerified) {
@@ -93,7 +98,7 @@ export const FirebaseProvider: React.FC<{ children: React.ReactNode }> = ({ chil
           displayName: safeName,
           photoUrl: safePhoto,
           role: 'member',
-          preferredEngine: 'AUTO',
+          preferredEngine: 'STANDALONE',
           preferredGame: '30s',
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
@@ -228,11 +233,13 @@ export const FirebaseProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         authReady,
         profileSynced,
         dbConnected,
+        firestoreLatencyMs,
         signingIn,
         authError,
         profile,
         signInWithGoogle,
         signOutUser,
+        refreshConnection,
         updatePreferences,
         updateConnectedGmail,
       }}

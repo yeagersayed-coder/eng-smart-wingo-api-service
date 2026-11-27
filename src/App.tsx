@@ -1,32 +1,16 @@
-import React, { useState, useEffect } from 'react';
-import { Zap, TrendingUp, FolderArchive, Activity, Server, Download, LogIn, LogOut, Cloud, AlertTriangle } from 'lucide-react';
+import React, { useState } from 'react';
+import { Zap, TrendingUp, FolderArchive, Activity, Server, Download, LogIn, LogOut, Cloud, AlertTriangle, Bell, BellOff, BellRing } from 'lucide-react';
 import { AnimatePresence, motion } from 'motion/react';
 import FamAppPaymentGateway from './components/FamAppPaymentGateway.js';
 import WinGoPredictor from './components/WinGoPredictor.js';
 import ZipHostVault from './components/ZipHostVault.js';
 import { useFirebase } from './contexts/FirebaseContext.js';
+import { useNotifications } from './contexts/NotificationContext.js';
 
 export default function App() {
-  const { user, authReady, profileSynced, dbConnected, signingIn, authError, signInWithGoogle, signOutUser } = useFirebase();
+  const { user, authReady, profileSynced, dbConnected, firestoreLatencyMs, signingIn, authError, signInWithGoogle, signOutUser } = useFirebase();
+  const { permission, browserEnabled, toggleBrowserAlerts } = useNotifications();
   const [activeTab, setActiveTab] = useState<'famapp' | 'wingo' | 'ziphost'>('famapp');
-  const [latency, setLatency] = useState(24);
-
-  // Ping backend status to measure live node latency
-  useEffect(() => {
-    const checkLatency = async () => {
-      const start = performance.now();
-      try {
-        await fetch('/api/payment/famapp/status');
-        setLatency(Math.max(12, Math.round(performance.now() - start)));
-      } catch {
-        setLatency(38);
-      }
-    };
-
-    checkLatency();
-    const interval = setInterval(checkLatency, 15000);
-    return () => clearInterval(interval);
-  }, []);
 
   return (
     <div className="min-h-screen bg-[#030712] text-slate-100 flex flex-col selection:bg-indigo-500 selection:text-white relative">
@@ -43,16 +27,16 @@ export default function App() {
           <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
             <div>
               <div className="flex items-center gap-2 mb-1">
-                <span className="h-2 w-2 rounded-full bg-emerald-400 animate-pulse" />
-                <span className="text-[10px] font-mono font-bold uppercase tracking-widest text-emerald-400">
-                  DEVELOPER GATEWAY NODE ONLINE
+                <span className={`h-2 w-2 rounded-full animate-pulse ${dbConnected ? 'bg-emerald-400' : 'bg-amber-400'}`} />
+                <span className={`text-[10px] font-mono font-bold uppercase tracking-widest ${dbConnected ? 'text-emerald-400' : 'text-amber-400'}`}>
+                  ZERO-API STANDALONE • FIREBASE {dbConnected ? 'CONNECTED' : 'LOCAL ENGINE'}
                 </span>
               </div>
               <h1 className="text-2xl sm:text-3xl font-black tracking-tight text-white font-display flex items-center gap-2">
-                FAMAPP PAYMENT <span className="text-indigo-400">&amp; WINGO API</span>
+                FAMAPP PAYMENT <span className="text-indigo-400">&amp; WINGO SUITE</span>
               </h1>
               <p className="text-xs text-slate-400 mt-1 max-w-2xl font-sans">
-                Automated FamApp Gmail payment gateway API with 10-second background scanning &amp; 10-minute auto-expiry, alongside high-speed WinGo 30S/1M prediction endpoints &amp; God-Mode protected zip website hosting.
+                100% API-Free client engine connected directly to Cloud Firestore — FamApp 10-second scanner &amp; 10-minute auto-expiry, deterministic WinGo 30S/1M predictor, and browser-native God-Mode ZIP vault.
               </p>
             </div>
 
@@ -61,18 +45,18 @@ export default function App() {
               <div className="bg-slate-900/90 border border-slate-800 rounded-xl px-3 py-1.5 flex items-center gap-2">
                 <Activity className="w-3.5 h-3.5 text-slate-400" />
                 <div className="text-left font-mono">
-                  <span className="text-[9px] uppercase text-slate-500 block leading-tight">Node Latency</span>
-                  <span className="text-xs font-bold text-white leading-tight">{latency}ms</span>
+                  <span className="text-[9px] uppercase text-slate-500 block leading-tight">Firebase Ping</span>
+                  <span className="text-xs font-bold text-white leading-tight">{firestoreLatencyMs}ms</span>
                 </div>
               </div>
 
               <div className="bg-slate-900/90 border border-slate-800 rounded-xl px-3 py-1.5 flex items-center gap-2">
                 <Server className="w-3.5 h-3.5 text-emerald-400" />
                 <div className="text-left font-mono">
-                  <span className="text-[9px] uppercase text-slate-500 block leading-tight">Gateway Engine</span>
+                  <span className="text-[9px] uppercase text-slate-500 block leading-tight">Core Mode</span>
                   <span className="text-xs font-bold text-emerald-400 leading-tight flex items-center gap-1">
                     <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-ping" />
-                    ONLINE
+                    NO-API + FB
                   </span>
                 </div>
               </div>
@@ -118,6 +102,46 @@ export default function App() {
                   </button>
                 )
               )}
+
+              <button
+                type="button"
+                onClick={toggleBrowserAlerts}
+                className={`rounded-xl px-3.5 py-2 flex items-center gap-2 transition font-mono text-xs font-bold cursor-pointer border focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-400 ${
+                  permission === 'granted' && browserEnabled
+                    ? 'bg-emerald-500/15 hover:bg-emerald-500/25 border-emerald-500/40 text-emerald-200 hover:text-white'
+                    : permission === 'denied'
+                    ? 'bg-amber-500/10 hover:bg-amber-500/20 border-amber-500/35 text-amber-200 hover:text-white'
+                    : 'bg-slate-900/90 hover:bg-slate-800 border-slate-700 text-slate-200 hover:text-white'
+                }`}
+                title={
+                  permission === 'granted'
+                    ? browserEnabled
+                      ? 'Browser & toast alerts enabled (click to mute desktop popups)'
+                      : 'Desktop popups muted (click to resume)'
+                    : permission === 'denied'
+                    ? 'Browser notifications blocked in site settings; in-app toast alerts active'
+                    : 'Enable native browser notifications for payment scans & WinGo signals'
+                }
+              >
+                {permission === 'granted' && browserEnabled ? (
+                  <BellRing className="w-3.5 h-3.5 text-emerald-400" />
+                ) : permission === 'granted' && !browserEnabled ? (
+                  <BellOff className="w-3.5 h-3.5 text-amber-400" />
+                ) : (
+                  <Bell className="w-3.5 h-3.5 text-indigo-400" />
+                )}
+                <span>
+                  {permission === 'granted'
+                    ? browserEnabled
+                      ? 'Alerts On'
+                      : 'Alerts Muted'
+                    : permission === 'denied'
+                    ? 'Toasts On'
+                    : permission === 'unsupported'
+                    ? 'Toasts Active'
+                    : 'Enable Alerts'}
+                </span>
+              </button>
 
               <a
                 href="/api/project-export/edgeone-zip"
